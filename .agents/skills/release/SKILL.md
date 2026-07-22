@@ -28,7 +28,7 @@ git describe --tags --abbrev=0          # last tag, e.g. v0.14.0
 git log <last-tag>..HEAD --oneline      # commits to be released
 ```
 
-Suggest a semver bump and **confirm with the user** before proceeding:
+Suggest a semver bump — it is confirmed together with the changelog in step 4, not here:
 
 - Breaking API change → major; `feat:` / user-visible feature → minor; only `fix:` → patch
 - Pre-release tags are allowed, e.g. `v0.15.0rc1` (the workflow marks them as prerelease)
@@ -41,18 +41,17 @@ pytest -m "not mpi and not slow" -n 10
 
 All tests must pass. On failure, stop and report — do not release.
 
-### 3. Draft the CHANGELOG entry
+### 3. Edit CHANGELOG.md
 
 Follow the conventions in [CHANGELOG_GUIDE.md](CHANGELOG_GUIDE.md) (categories, entry style, version links). Key points:
 
 - Base the entry on `git log <last-tag>..HEAD` and PR titles. Read the actual implementation when a commit message is unclear — do not invent changes.
 - Heading format is mandatory — CI extracts release notes by it: `## [0.15.0] - 2026-07-22`
-- Insert the entry at the top of `CHANGELOG.md` (below `## [Unreleased]`, above previous releases) and update the version links at the bottom of the file.
-- Show the draft to the user for approval.
+- Edit `CHANGELOG.md` directly: insert the entry at the top (below `## [Unreleased]`, above previous releases) and update the version links at the bottom of the file.
 
-### 4. Commit, tag, push
+### 4. Confirm, then commit, tag, push
 
-Ask for user confirmation before the git mutations. **Push to `origin` only — never to `upstream`.**
+Present the proposed version and the edited `CHANGELOG.md` entry, and ask for user confirmation — this is the single approval point for the version, the changelog, and the git mutations. On approval, proceed. **Push to `origin` only — never to `upstream`.**
 
 ```bash
 git add CHANGELOG.md
