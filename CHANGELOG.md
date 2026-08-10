@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-08-10
+
+### Fixed
+- Fix 3D MPI segfault or silent corruption after `MovingWindow` shift: `init_neighbor_rank_3d` now consults the `patch_rank_map` instead of indexing the local patch list with the global neighbor index, matching the 2D implementation
+
 ## [0.15.0] - 2026-07-22
 
 ### Added
@@ -28,5 +33,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Speed up particle sorting via mismatch-list gather and lazy particle-list refresh
 - Cache MPI derived datatypes used in boundary guard-field sync
 
-[Unreleased]: https://github.com/xsgeng/lambdapic/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/xsgeng/lambdapic/compare/v0.15.1...HEAD
+[0.15.1]: https://github.com/xsgeng/lambdapic/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/xsgeng/lambdapic/compare/v0.14.0...v0.15.0
