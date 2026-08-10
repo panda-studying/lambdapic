@@ -623,7 +623,7 @@ class Patches:
         """
         if not patch_rank_map:
             patch_rank_map = {}
-            
+
         for p in self.patches:
             assert p.rank is not None, f"Patch {p.index} rank is None"
             patch_rank_map[p.index] = p.rank
@@ -633,7 +633,7 @@ class Patches:
             for bound in Boundary3D:
                 neighbor_index = p.neighbor_index[bound]
                 if neighbor_index >= 0:
-                    neighbor_rank = self.patches[neighbor_index].rank
+                    neighbor_rank = patch_rank_map[neighbor_index]
                     if neighbor_rank != p.rank:
                         p.set_neighbor_rank(**{bound.name.lower(): neighbor_rank})
 
