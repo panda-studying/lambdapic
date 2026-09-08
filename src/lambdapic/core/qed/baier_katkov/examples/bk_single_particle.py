@@ -2,11 +2,13 @@
 
 Builds a *closed* synchrotron circle (one full turn, ``r(0)=r(T)``,
 ``u(0)=u(T)``) and computes the angle-integrated ``dW/domega`` (and
-``dE/domega``) spectrum at the synchrotron harmonics ``omega = m Omega``.
-A closed orbit removes the hard-truncation boundary terms of the double-time
-integral, so the angle-integrated spectrum is genuinely positive (and equals
-the classical Liénard--Wiechert spectrum in the soft-photon limit); it is
-never clipped.
+``dE/domega``) spectrum at the recoil-shifted synchrotron harmonics
+``omega_m = m Omega / (1 + m Omega / epsilon)``.  These are the frequencies at
+which the one-turn BK double-time integral is periodic, so the
+hard-truncation boundary terms vanish and the angle-integrated spectrum is
+genuinely positive (and equals the classical Liénard--Wiechert spectrum in
+the soft-photon limit); it is never clipped.  Evaluating at the bare
+``m Omega`` instead would leave an ``O(m omega/epsilon)`` truncation artifact.
 
 Run from anywhere with::
 
@@ -21,6 +23,7 @@ import numpy as np
 
 from ..types import Parameters, Trajectory
 from ..integrator import compute_spectrum
+from ..reference import recoil_shifted_harmonic
 from ..result import format_spectrum, save_spectrum_text
 
 
@@ -52,10 +55,12 @@ def main() -> None:
     # incident electron energy = gamma * m = gamma (natural units, m = 1)
     params = Parameters(epsilon=gamma, mass=1.0, charge=1.0)
 
-    # synchrotron harmonics: a closed orbit radiates only at omega = m Omega.
-    # (Soft-photon regime omega/eps << 1 here, so BK ~ LW; see validation.py.)
+    # recoil-shifted synchrotron harmonics: a closed orbit radiates at
+    # omega_m = m Omega / (1 + m Omega/eps), where the BK one-turn integral is
+    # periodic.  (Soft-photon regime omega/eps << 1 here, so BK ~ LW; see
+    # validation.py V3/V8.)
     n_harmonics = 8
-    omega_grid = np.array([m * Omega for m in range(1, n_harmonics + 1)])
+    omega_grid = recoil_shifted_harmonic(np.arange(1, n_harmonics + 1), Omega, gamma)
 
     # Full-sphere angle integration.  The circle lies in the x-y plane and its
     # emission is azimuthally symmetric about the z-axis, so n_phi=1 with a

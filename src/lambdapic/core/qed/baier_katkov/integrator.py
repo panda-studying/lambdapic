@@ -1,23 +1,39 @@
 """Direct double-time integration of the Baier--Katkov kernel.
 
 Reference implementation (phase 1 of `Baier-Katkov-multiparticle.md` sec. 15):
-single particle, FP64, plain trapezoid over the full recorded record, no GPU,
-no formation-length windowing, no importance sampling.  It is intentionally
-slow and explicit; it exists to fix conventions, not to be fast.
+single particle, FP64, plain trapezoid over the full recorded record, no
+formation-length windowing, no importance sampling.  Two backends evaluate
+the *same* double sum:
+
+* ``"numpy"`` -- chunked outer-product reference path.  Slow; kept as the
+  ground truth for cross-checks.
+* ``"numba"`` -- parallel, cache-compiled direct summation that exploits the
+  Hermitian symmetry ``K(t2, t1) = K(t1, t2)^*`` (upper triangle only) and
+  batches every ``(omega, n)`` pair of a spectrum into one pass over the
+  ``(t1, t2)`` pairs (kernel shared between directions, phase argument shared
+  between frequencies).  Still ``O(Nt^2)`` per record and
+  ``O(Nt^2 N_omega N_dir)`` per spectrum -- it is a fast evaluation of the
+  reference method, not a different method.
 
 Primary output quantities (natural units, ``m_e = 1``)::
 
-    d2E/dw dO = (alpha/pi) * w^2 * q^2 * Re [ int dt1 dt2 N e^{-i Phi} ]
+    d2E/dw dO = (alpha/(4 pi^2)) * w^2 * q^2 * Re [ int dt1 dt2 N e^{-i Phi} ]
     d2W/dw dO = d2E/dw dO / w
 
 with ``N`` the kernel (eq. 7.3 / 7.1) and ``Phi`` the recoil phase
 (eq. 5.3), both from :mod:`.kernel` / :mod:`.phase`.  ``q`` is the charge
-multiplicity (``= 1`` for a single electron).  The angle-integrated spectrum
-``dW/dw`` is obtained by quadrature over a cone of directions.
+multiplicity (``= 1`` for a single electron).  The prefactor is the
+``e^2/(4 pi^2)`` of the Liénard--Wiechert spectrum (Jackson eq. 14.67,
+Gaussian units) with ``e^2 = alpha`` for ``hbar = c = 1``; it reproduces the
+Schwinger synchrotron spectrum and the Larmor power (validation V4) and is
+the same normalization as the LCFA rates in ``core/qed/optical_depth_tables``.
+The angle-integrated spectrum ``dW/dw`` is obtained by quadrature over a cone
+of directions.
 
 Because the double-time kernel obeys ``K(t2, t1) = K(t1, t2)^*`` the integral
-is real; the imaginary part is kept as a numerical diagnostic, never dropped
-silently.
+is real.  The numpy path evaluates the full square and keeps the imaginary
+part as a round-off diagnostic; the numba path uses the symmetry explicitly,
+so its imaginary part is zero by construction.
 """
 
 from __future__ import annotations
@@ -30,9 +46,17 @@ from . import phase as _phase
 from .types import Parameters, Spectrum, Trajectory
 from .units import fine_structure
 
+try:
+    import numba as _numba
+except ImportError:  # pragma: no cover - numba is a lambdapic dependency
+    _numba = None
+
 __all__ = [
+    "PREFACTOR",
+    "available_backends",
     "trapz_weights",
     "double_time_integral",
+    "double_time_integral_batch",
     "d2_probability",
     "d2_energy",
     "classical_d2_energy",
@@ -41,61 +65,120 @@ __all__ = [
     "compute_spectrum",
 ]
 
+#: ``e^2 / (4 pi^2)`` in Gaussian natural units (``e^2 = alpha``, ``hbar = c = 1``).
+PREFACTOR = fine_structure / (4.0 * np.pi ** 2)
 
+_KERNELS = ("dot", "trace", "velocity")
+_KERNEL_ID = {"dot": 0, "trace": 1, "velocity": 2}
+_PHASES = ("recoil", "classical")
+
+
+# --------------------------------------------------------------------------
+# backend selection
+# --------------------------------------------------------------------------
+def available_backends():
+    """Backends usable on this installation (``"numpy"`` is always present)."""
+    return ("numpy", "numba") if _numba is not None else ("numpy",)
+
+
+def _resolve_backend(backend):
+    if backend == "auto":
+        return "numba" if _numba is not None else "numpy"
+    if backend == "numba" and _numba is None:
+        raise RuntimeError("backend='numba' requested but numba is not importable")
+    if backend not in ("numpy", "numba"):
+        raise ValueError("backend must be 'auto', 'numpy' or 'numba'")
+    return backend
+
+
+# --------------------------------------------------------------------------
+# quadrature weights and per-frequency bookkeeping
+# --------------------------------------------------------------------------
 def trapz_weights(time):
-    """1-D trapezoid weights for a sorted (not necessarily uniform) time grid."""
+    """1-D trapezoid weights for a sorted (not necessarily uniform) time grid.
+
+    A single-sample grid has no interval to integrate over and returns a
+    zero weight; callers should normally reject ``Nt < 2`` trajectories
+    earlier (see :class:`.Trajectory`).
+    """
     time = np.asarray(time, dtype=np.float64)
     w = np.empty_like(time)
+    if len(time) == 1:
+        w[0] = 0.0
+        return w
     dt = np.diff(time)
     w[0] = dt[0] / 2.0
     w[-1] = dt[-1] / 2.0
     if len(time) > 2:
         w[1:-1] = (dt[:-1] + dt[1:]) / 2.0
-    elif len(time) == 2:
-        w[0] = w[-1] = (time[1] - time[0]) / 2.0
     return w
 
 
-def double_time_integral(time, position, beta, omega, n, epsilon, mass=1.0,
-                         kernel="dot", epsilon_prime=None, phase="recoil",
-                         chunk=256):
-    """Return ``I = int dt1 dt2 N(t1,t2) exp(-i Phi(t1,t2))`` (complex).
+def _final_energy(omega, epsilon, epsilon_prime):
+    """``epsilon'`` broadcast to the shape of ``omega``.
 
-    Parameters
-    ----------
-    time, position, beta : arrays of shape (Nt,) / (Nt, 3)
-    omega : float
-        photon angular frequency (natural units).
-    n : (3,) unit vector.
-    epsilon : float
-        incident electron energy.
-    kernel : ``"dot"`` (default) or ``"trace"``.
-    epsilon_prime : float, optional
-        Final-state energy label.  Default ``epsilon - omega`` (BK recoil);
-        pass ``epsilon`` for the recoilless / classical comparison.
-    phase : ``"recoil"`` (default) or ``"classical"``.
-        ``"recoil"`` uses the recoil-scaled frequency ``omega*epsilon/epsilon'``
-        (eq. 5.3); ``"classical"`` uses the bare ``omega`` (eq. 7.4 reference).
-    chunk : int
-        row-block size for the memory-bounded outer product.
+    ``None`` means the BK recoil label ``epsilon - omega`` and requires
+    ``omega < epsilon``; a scalar or array is broadcast as given (e.g. the
+    classical ``epsilon' = epsilon``).
     """
-    time = np.asarray(time, dtype=np.float64)
-    position = np.asarray(position, dtype=np.float64)
-    beta = np.asarray(beta, dtype=np.float64)
-    n = np.asarray(n, dtype=np.float64)
-    nt = time.shape[0]
-
-    w = trapz_weights(time)
+    omega = np.asarray(omega, dtype=np.float64)
     if epsilon_prime is None:
-        epsilon_prime = epsilon - omega
-    if phase == "recoil":
-        factor = _phase.recoil_frequency(omega, epsilon, epsilon_prime)
-    elif phase == "classical":
-        factor = float(omega)
-    else:
-        raise ValueError("phase must be 'recoil' or 'classical'")
+        if np.any(omega >= epsilon):
+            raise ValueError(
+                f"omega = {omega} must be < epsilon = {epsilon} "
+                "(the recoil final-state energy epsilon' = epsilon - omega "
+                "must be positive)"
+            )
+        return epsilon - omega
+    eps_p = np.asarray(epsilon_prime, dtype=np.float64)
+    return np.array(np.broadcast_to(eps_p, omega.shape), dtype=np.float64)
 
-    kern = _kernel.dot_kernel if kernel == "dot" else _kernel.trace_kernel
+
+def _phase_factor(phase, omega, epsilon, eps_p):
+    """Frequency multiplying ``(t2 - t1) - n.(r2 - r1)`` in the phase."""
+    omega = np.asarray(omega, dtype=np.float64)
+    if phase == "recoil":
+        return np.asarray(_phase.recoil_frequency(omega, epsilon, eps_p), dtype=np.float64)
+    if phase == "classical":
+        return omega
+    raise ValueError("phase must be 'recoil' or 'classical'")
+
+
+def _kernel_coefficients(kernel, omega, epsilon, eps_p, mass):
+    """Per-frequency ``(a, b)`` such that ``N = a + b * x``.
+
+    ``x`` is the pair-dependent scalar: ``b1.b2 - 1`` for ``"dot"``
+    (eq. 7.3), ``(b1 - b2)^2`` for ``"trace"`` (eq. 7.1) and
+    ``b1.b2 - (n.b1)(n.b2)`` for ``"velocity"`` (direction dependent).
+    """
+    omega = np.asarray(omega, dtype=np.float64)
+    eps_p = np.asarray(eps_p, dtype=np.float64)
+    if kernel == "dot":
+        gamma2 = (epsilon / mass) ** 2
+        a = (omega ** 2 / gamma2) / (2.0 * eps_p ** 2)
+        b = (epsilon ** 2 + eps_p ** 2) / (2.0 * eps_p ** 2)
+    elif kernel == "trace":
+        a = -(mass ** 2 / (epsilon * eps_p)) * np.ones_like(omega)
+        b = -(epsilon ** 2 + eps_p ** 2) / (4.0 * eps_p ** 2)
+    else:
+        a = np.zeros_like(omega)
+        b = np.ones_like(omega)
+    return a, b
+
+
+# --------------------------------------------------------------------------
+# numpy reference path (full square, complex)
+# --------------------------------------------------------------------------
+def _double_sum_numpy(time, position, beta, n, factor, kernel, epsilon, omega,
+                      eps_p, mass, chunk):
+    nt = time.shape[0]
+    w = trapz_weights(time)
+    if kernel == "dot":
+        kern = _kernel.dot_kernel
+    elif kernel == "trace":
+        kern = _kernel.trace_kernel
+    else:
+        kern = None  # classical transverse-velocity kernel, no energy dependence
 
     total = 0.0 + 0.0j
     for start in range(0, nt, chunk):
@@ -109,11 +192,11 @@ def double_time_integral(time, position, beta, omega, n, epsilon, mass=1.0,
         n_dot_dr = np.tensordot(dr, n, axes=([2], [0]))  # (nchunk, Nt)
         Phi = factor * (dt - n_dot_dr)
 
-        if kernel == "velocity":
+        if kern is None:
             N = _kernel.classical_velocity_kernel(bi[:, None, :], beta[None, :, :], n)
         else:
             N = kern(bi[:, None, :], beta[None, :, :], epsilon, omega, mass=mass,
-                     epsilon_prime=epsilon_prime)
+                     epsilon_prime=eps_p)
         K = N * np.exp(-1j * Phi)
 
         total += np.einsum("i,ij,j->", w[idx], K, w)
@@ -121,31 +204,239 @@ def double_time_integral(time, position, beta, omega, n, epsilon, mass=1.0,
     return total
 
 
+# --------------------------------------------------------------------------
+# numba path (upper triangle, real, batched over omega and directions)
+# --------------------------------------------------------------------------
+if _numba is not None:
+    from numba import njit, prange
+
+    @njit(cache=True)
+    def _accumulate_row(i, time, w, beta, nr, nb, fac, a, b, kernel_id, acc, psi):
+        """Add row ``i`` (``j >= i``) of the double sum to ``acc[k, d]``.
+
+        ``Re[N e^{-i Phi}] = N cos(Phi)`` for the real kernels; off-diagonal
+        pairs are counted twice (Hermitian symmetry).  ``nr[j, d] = n_d.r_j``
+        and ``nb[j, d] = n_d.b_j`` are precomputed projections.
+        """
+        nt = time.shape[0]
+        nk = fac.shape[0]
+        nd = psi.shape[0]
+        ti = time[i]
+        wi = w[i]
+        bix = beta[i, 0]
+        biy = beta[i, 1]
+        biz = beta[i, 2]
+        for j in range(i, nt):
+            dt = time[j] - ti
+            wij = wi * w[j]
+            if j > i:
+                wij *= 2.0
+            dot = bix * beta[j, 0] + biy * beta[j, 1] + biz * beta[j, 2]
+            for d in range(nd):
+                psi[d] = dt - (nr[j, d] - nr[i, d])
+            if kernel_id == 2:
+                # classical transverse kernel: x depends on the direction
+                for d in range(nd):
+                    x = dot - nb[i, d] * nb[j, d]
+                    for k in range(nk):
+                        acc[k, d] += wij * (a[k] + b[k] * x) * np.cos(fac[k] * psi[d])
+            else:
+                if kernel_id == 0:
+                    x = dot - 1.0
+                else:
+                    dbx = bix - beta[j, 0]
+                    dby = biy - beta[j, 1]
+                    dbz = biz - beta[j, 2]
+                    x = dbx * dbx + dby * dby + dbz * dbz
+                for k in range(nk):
+                    wN = wij * (a[k] + b[k] * x)
+                    f = fac[k]
+                    for d in range(nd):
+                        acc[k, d] += wN * np.cos(f * psi[d])
+
+    @njit(parallel=True, cache=True)
+    def _double_sum_batch(time, w, beta, nr, nb, fac, a, b, kernel_id, block):
+        nt = time.shape[0]
+        nk = fac.shape[0]
+        nd = nr.shape[1]
+        half = (nt + 1) // 2
+        nblocks = (half + block - 1) // block
+        partial = np.zeros((nblocks, nk, nd))
+        for ib in prange(nblocks):
+            acc = np.zeros((nk, nd))
+            psi = np.empty(nd)
+            i0 = ib * block
+            i1 = min(i0 + block, half)
+            for ii in range(i0, i1):
+                # rows ii and nt-1-ii together hold nt-1 off-diagonal pairs,
+                # so every iteration carries the same amount of work
+                _accumulate_row(ii, time, w, beta, nr, nb, fac, a, b, kernel_id, acc, psi)
+                jj = nt - 1 - ii
+                if jj != ii:
+                    _accumulate_row(jj, time, w, beta, nr, nb, fac, a, b, kernel_id, acc, psi)
+            partial[ib, :, :] = acc
+        out = np.zeros((nk, nd))
+        for ib in range(nblocks):
+            out += partial[ib]
+        return out
+
+
+# --------------------------------------------------------------------------
+# public integrals
+# --------------------------------------------------------------------------
+def double_time_integral_batch(time, position, beta, omega, dirs, epsilon, mass=1.0,
+                               kernel="dot", epsilon_prime=None, phase="recoil",
+                               backend="auto", block=None, chunk=256):
+    """``Re int dt1 dt2 N e^{-i Phi}`` for every ``(omega[k], dirs[d])`` pair.
+
+    Parameters
+    ----------
+    time, position, beta : arrays of shape (Nt,) / (Nt, 3)
+    omega : (N_omega,) photon angular frequencies (natural units).
+    dirs : (N_dir, 3) unit vectors.
+    epsilon : float
+        incident electron energy.
+    epsilon_prime : None, float or (N_omega,) array
+        Final-state energy label.  ``None`` -> ``epsilon - omega`` (BK
+        recoil, requires ``omega < epsilon``); pass ``epsilon`` for the
+        recoilless / classical comparison.
+    kernel : ``"dot"`` (default), ``"trace"`` or ``"velocity"``.
+        ``"dot"`` / ``"trace"`` are the two BK kernels (eq. 7.3 / 7.1);
+        ``"velocity"`` is the classical transverse-velocity kernel used for
+        internal consistency checks (validation V2).
+    phase : ``"recoil"`` (default) or ``"classical"``.
+        ``"recoil"`` uses the recoil-scaled frequency ``omega*epsilon/epsilon'``
+        (eq. 5.3); ``"classical"`` uses the bare ``omega`` (eq. 7.4 reference).
+    backend : ``"auto"`` (numba if importable), ``"numba"`` or ``"numpy"``.
+    block : int, optional
+        numba only: folded rows per parallel task (default adapts to the
+        thread count).
+    chunk : int
+        numpy only: row-block size of the memory-bounded outer product.
+
+    Returns
+    -------
+    (N_omega, N_dir) float array.
+    """
+    if kernel not in _KERNELS:
+        raise ValueError("kernel must be 'dot', 'trace' or 'velocity'")
+    if phase not in _PHASES:
+        raise ValueError("phase must be 'recoil' or 'classical'")
+    backend = _resolve_backend(backend)
+
+    time = np.ascontiguousarray(time, dtype=np.float64)
+    position = np.ascontiguousarray(position, dtype=np.float64)
+    beta = np.ascontiguousarray(beta, dtype=np.float64)
+    omega = np.atleast_1d(np.asarray(omega, dtype=np.float64))
+    dirs = np.atleast_2d(np.asarray(dirs, dtype=np.float64))
+    eps_p = _final_energy(omega, epsilon, epsilon_prime)
+    fac = _phase_factor(phase, omega, epsilon, eps_p)
+
+    if backend == "numpy":
+        out = np.empty((omega.shape[0], dirs.shape[0]))
+        for k in range(omega.shape[0]):
+            for d in range(dirs.shape[0]):
+                out[k, d] = _double_sum_numpy(
+                    time, position, beta, dirs[d], float(fac[k]), kernel, epsilon,
+                    float(omega[k]), float(eps_p[k]), mass, chunk,
+                ).real
+        return out
+
+    a, b = _kernel_coefficients(kernel, omega, epsilon, eps_p, mass)
+    w = trapz_weights(time)
+    nr = np.ascontiguousarray(position @ dirs.T)   # (Nt, N_dir)  n_d . r_j
+    nb = np.ascontiguousarray(beta @ dirs.T)       # (Nt, N_dir)  n_d . b_j
+    if block is None:
+        half = (time.shape[0] + 1) // 2
+        block = max(1, min(32, half // (4 * _numba.get_num_threads())))
+    return _double_sum_batch(
+        time, w, beta, nr, nb,
+        np.ascontiguousarray(fac), np.ascontiguousarray(a), np.ascontiguousarray(b),
+        _KERNEL_ID[kernel], int(block),
+    )
+
+
+def double_time_integral(time, position, beta, omega, n, epsilon, mass=1.0,
+                         kernel="dot", epsilon_prime=None, phase="recoil",
+                         chunk=256, backend="auto"):
+    """Return ``I = int dt1 dt2 N(t1,t2) exp(-i Phi(t1,t2))`` (complex) for
+    one ``(omega, n)``.
+
+    See :func:`double_time_integral_batch` for the parameters.  With the
+    numpy backend the full square is summed and the imaginary part is a
+    round-off diagnostic; with the numba backend the Hermitian symmetry is
+    used explicitly and the imaginary part is exactly zero.
+    """
+    if kernel not in _KERNELS:
+        raise ValueError("kernel must be 'dot', 'trace' or 'velocity'")
+    if phase not in _PHASES:
+        raise ValueError("phase must be 'recoil' or 'classical'")
+    backend = _resolve_backend(backend)
+    omega = float(omega)
+    eps_p = float(np.asarray(_final_energy(omega, epsilon, epsilon_prime)))
+    factor = float(np.asarray(_phase_factor(phase, omega, epsilon, eps_p)))
+
+    if backend == "numpy":
+        time = np.asarray(time, dtype=np.float64)
+        position = np.asarray(position, dtype=np.float64)
+        beta = np.asarray(beta, dtype=np.float64)
+        n = np.asarray(n, dtype=np.float64)
+        return _double_sum_numpy(time, position, beta, n, factor, kernel, epsilon,
+                                 omega, eps_p, mass, chunk)
+
+    out = double_time_integral_batch(time, position, beta, [omega], [n], epsilon,
+                                     mass=mass, kernel=kernel, epsilon_prime=eps_p,
+                                     phase=phase, backend="numba")
+    return complex(out[0, 0], 0.0)
+
+
 def d2_energy(time, position, beta, omega, n, epsilon, mass=1.0, charge=1.0,
-              kernel="dot", epsilon_prime=None, phase="recoil", chunk=256):
-    """Differential energy spectrum ``d2E/(dw dO)`` for one (omega, n)."""
+              kernel="dot", epsilon_prime=None, phase="recoil", chunk=256,
+              diagnostics=False, backend="auto"):
+    """Differential energy spectrum ``d2E/(dw dO)`` for one (omega, n).
+
+    With ``diagnostics=True`` returns ``(d2E, d2E_imag)`` where ``d2E_imag``
+    is the imaginary part scaled by the same prefactor (round-off level with
+    the numpy backend, identically zero with numba); the real part is the
+    physical spectrum.
+    """
     I = double_time_integral(time, position, beta, omega, n, epsilon,
                              mass=mass, kernel=kernel, epsilon_prime=epsilon_prime,
-                             phase=phase, chunk=chunk)
-    return (fine_structure / np.pi) * omega ** 2 * charge ** 2 * I.real
+                             phase=phase, chunk=chunk, backend=backend)
+    pref = PREFACTOR * omega ** 2 * charge ** 2
+    d2E = pref * I.real
+    if diagnostics:
+        return d2E, pref * I.imag
+    return d2E
 
 
 def d2_probability(time, position, beta, omega, n, epsilon, mass=1.0, charge=1.0,
-                   kernel="dot", epsilon_prime=None, phase="recoil", chunk=256):
-    """Differential probability ``d2W/(dw dO)`` for one (omega, n)."""
+                   kernel="dot", epsilon_prime=None, phase="recoil", chunk=256,
+                   diagnostics=False, backend="auto"):
+    """Differential probability ``d2W/(dw dO)`` for one (omega, n).
+
+    With ``diagnostics=True`` returns ``(d2W, d2W_imag)`` (see
+    :func:`d2_energy`).
+    """
+    if diagnostics:
+        d2E, d2E_imag = d2_energy(time, position, beta, omega, n, epsilon,
+                                   mass=mass, charge=charge, kernel=kernel,
+                                   epsilon_prime=epsilon_prime, phase=phase,
+                                   chunk=chunk, diagnostics=True, backend=backend)
+        return d2E / omega, d2E_imag / omega
     return d2_energy(time, position, beta, omega, n, epsilon, mass=mass,
                      charge=charge, kernel=kernel, epsilon_prime=epsilon_prime,
-                     phase=phase, chunk=chunk) / omega
+                     phase=phase, chunk=chunk, backend=backend) / omega
 
 
 def classical_d2_energy(time, position, beta, omega, n, charge=1.0):
-    """Classical LW reference ``d2E/(dw dO) = (alpha/pi) w^2 |A|^2`` (eq. 7.4).
+    """Classical LW reference ``d2E/(dw dO) = (alpha/(4 pi^2)) w^2 |A|^2`` (eq. 7.4).
 
     ``A`` is the vector amplitude ``int dt v e^{i omega [t - n.r]}`` with
     ``v = n x (n x beta)``; ``|A|^2`` is the sum over its three components.
     """
     A = _kernel.classical_amplitude(time, position, beta, omega, n)
-    return (fine_structure / np.pi) * omega ** 2 * charge ** 2 * np.sum(np.abs(A) ** 2)
+    return PREFACTOR * omega ** 2 * charge ** 2 * np.sum(np.abs(A) ** 2)
 
 
 def cone_directions(axis, theta_max, n_theta, n_phi):
@@ -187,30 +478,54 @@ def cone_directions(axis, theta_max, n_theta, n_phi):
     return np.asarray(dirs), np.asarray(dom)
 
 
-class BKIntegrator:
-    """Convenience wrapper bundling a trajectory and parameters."""
+def _recoil_args(params):
+    """Map ``Parameters.recoil`` onto the integrator's ``(phase, epsilon_prime)``.
 
-    def __init__(self, trajectory: Trajectory, params: Parameters) -> None:
+    ``"baier_katkov"`` -> recoil phase with ``epsilon' = epsilon - omega``
+    (default); ``"classical"`` -> classical phase with ``epsilon' = epsilon``.
+    """
+    if params.recoil == "baier_katkov":
+        return "recoil", None
+    if params.recoil == "classical":
+        return "classical", params.epsilon
+    raise ValueError("recoil must be 'baier_katkov' or 'classical'")
+
+
+class BKIntegrator:
+    """Convenience wrapper bundling a trajectory, parameters and a backend."""
+
+    def __init__(self, trajectory: Trajectory, params: Parameters,
+                 backend: str = "auto") -> None:
         self.trajectory = trajectory
         self.params = params
+        self.backend = _resolve_backend(backend)
         self.time = trajectory.time
         self.position = trajectory.position
         self.beta = trajectory.beta()
 
-    # -- single (omega, n) -------------------------------------------------
-    def d2_probability(self, omega, n):
-        return d2_probability(
-            self.time, self.position, self.beta, omega, n,
-            self.params.epsilon, mass=self.params.mass, charge=self.params.charge,
-            kernel=self.params.kernel,
+    # -- grids of (omega, n) ------------------------------------------------
+    def d2_energy_batch(self, omega_grid, dirs):
+        """``d2E/(dw dO)`` on the full ``(N_omega, N_dir)`` grid."""
+        omega_grid = np.atleast_1d(np.asarray(omega_grid, dtype=np.float64))
+        phase, eps_p = _recoil_args(self.params)
+        I = double_time_integral_batch(
+            self.time, self.position, self.beta, omega_grid, dirs,
+            self.params.epsilon, mass=self.params.mass, kernel=self.params.kernel,
+            epsilon_prime=eps_p, phase=phase, backend=self.backend,
         )
+        return PREFACTOR * omega_grid[:, None] ** 2 * self.params.charge ** 2 * I
 
+    def d2_probability_batch(self, omega_grid, dirs):
+        """``d2W/(dw dO)`` on the full ``(N_omega, N_dir)`` grid."""
+        omega_grid = np.atleast_1d(np.asarray(omega_grid, dtype=np.float64))
+        return self.d2_energy_batch(omega_grid, dirs) / omega_grid[:, None]
+
+    # -- single (omega, n) -------------------------------------------------
     def d2_energy(self, omega, n):
-        return d2_energy(
-            self.time, self.position, self.beta, omega, n,
-            self.params.epsilon, mass=self.params.mass, charge=self.params.charge,
-            kernel=self.params.kernel,
-        )
+        return float(self.d2_energy_batch([omega], [n])[0, 0])
+
+    def d2_probability(self, omega, n):
+        return self.d2_energy(omega, n) / omega
 
     # -- spectrum ----------------------------------------------------------
     def compute_spectrum(self, omega_grid, theta_max=None, n_theta=16, n_phi=8,
@@ -220,7 +535,7 @@ class BKIntegrator:
         The cone axis defaults to the initial velocity direction (beam axis);
         ``theta_max`` defaults to ``5 / gamma``.
         """
-        omega_grid = np.asarray(omega_grid, dtype=np.float64)
+        omega_grid = np.atleast_1d(np.asarray(omega_grid, dtype=np.float64))
         if axis is None:
             beta0 = self.beta[0]
             if np.linalg.norm(beta0) < 1e-12:
@@ -233,16 +548,9 @@ class BKIntegrator:
 
         dirs, dom = cone_directions(axis, theta_max, n_theta, n_phi)
 
-        dW = np.zeros_like(omega_grid)
-        dE = np.zeros_like(omega_grid)
-        for k, om in enumerate(omega_grid):
-            acc_W = 0.0
-            acc_E = 0.0
-            for nd, dO in zip(dirs, dom):
-                acc_W += self.d2_probability(om, nd) * dO
-                acc_E += self.d2_energy(om, nd) * dO
-            dW[k] = acc_W
-            dE[k] = acc_E
+        d2E = self.d2_energy_batch(omega_grid, dirs)   # (N_omega, N_dir)
+        dE = d2E @ dom
+        dW = dE / omega_grid
 
         meta = dict(
             epsilon=self.params.epsilon,
@@ -257,14 +565,16 @@ class BKIntegrator:
             theta_max=float(theta_max),
             n_theta=int(n_theta),
             n_phi=int(n_phi),
+            backend=self.backend,
             units="natural (c=hbar=1, m_e=1)",
         )
         return Spectrum(omega=omega_grid, dW_domega=dW, dE_domega=dE, metadata=meta)
 
 
 def compute_spectrum(trajectory: Trajectory, params: Parameters, omega_grid,
-                     theta_max=None, n_theta=16, n_phi=8, axis=None) -> Spectrum:
+                     theta_max=None, n_theta=16, n_phi=8, axis=None,
+                     backend="auto") -> Spectrum:
     """Convenience function: build an integrator and return the spectrum."""
-    return BKIntegrator(trajectory, params).compute_spectrum(
+    return BKIntegrator(trajectory, params, backend=backend).compute_spectrum(
         omega_grid, theta_max=theta_max, n_theta=n_theta, n_phi=n_phi, axis=axis
     )

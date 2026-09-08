@@ -55,9 +55,13 @@ fine_structure = float(alpha)        # dimensionless ~ 1/137.036
 electron_mass = float(m_e)           # kg
 electron_mass_energy = float(m_e * c ** 2)   # J  (m_e c^2)
 
-# In Heaviside--Lorentz natural units alpha = e^2 / (4 pi), so
-# e^2 / (4 pi^2) = alpha / pi.  We never use the SI charge magnitude `e`
-# directly in the integrand; only `alpha` enters the radiation prefactor.
+# The radiation prefactor is e^2/(4 pi^2) in Gaussian units (Jackson 14.67),
+# i.e. alpha/(4 pi^2) for hbar = c = 1 where e_G^2 = alpha; in
+# Heaviside--Lorentz units the same physical prefactor reads
+# e_HL^2/(16 pi^3) with e_HL^2 = 4 pi alpha.  Do NOT insert the HL charge into
+# the Gaussian formula (that gives a spurious alpha/pi, a factor 4 pi too
+# large).  We never use the SI charge magnitude `e` directly in the
+# integrand; only `alpha` enters the radiation prefactor.
 
 # --------------------------------------------------------------------------
 # Compton-unit natural scales (picture 1, m_e = 1)

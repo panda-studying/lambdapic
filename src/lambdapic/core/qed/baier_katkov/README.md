@@ -27,9 +27,16 @@ single-particle differential spectra (natural units `c = hbar = 1`, `m_e = 1`):
 自旋平均、极化求和的单粒子微分谱（自然单位 `c = hbar = 1`，`m_e = 1`）：
 
 ```
-d2E/(dw dO) = (alpha/pi) * w^2 * q^2 * Re[ int dt1 dt2 N e^{-i Phi} ]
+d2E/(dw dO) = (alpha/(4 pi^2)) * w^2 * q^2 * Re[ int dt1 dt2 N e^{-i Phi} ]
 d2W/(dw dO) = d2E/(dw dO) / w
 ```
+
+(The prefactor is Jackson's `e^2/(4 pi^2)` with `e^2 = alpha` in Gaussian
+natural units; it reproduces the Schwinger synchrotron spectrum / Larmor
+power and matches the normalization of the LCFA rates in
+`core/qed/optical_depth_tables.py`.)
+（前因子即 Jackson 的 `e^2/(4 pi^2)`，高斯自然单位下 `e^2 = alpha`；它重现 Schwinger
+同步辐射谱 / Larmor 功率，并与 `core/qed/optical_depth_tables.py` 中 LCFA 速率的归一化一致。）
 
 with / 其中
 
@@ -51,10 +58,16 @@ obtained by quadrature over a cone of directions around the initial velocity.
 
 ## Assumptions and conventions (read before trusting any number) / 假设与约定（采信任何数字前请先阅读）
 
-* **Single particle**, FP64, direct trapezoid double-time integration.  No
-  MPI/GPU/NUFFT/FFT, no formation-length windowing, no importance sampling.
-  **单粒子**，FP64，直接梯形双时间积分。无 MPI/GPU/NUFFT/FFT，无形成长度窗口，
-  无重要性采样。
+* **Single particle**, FP64, direct trapezoid double-time integration.  Two
+  backends evaluate the same double sum: a chunked **numpy** reference path and
+  a parallel **numba** path (default when numba is importable) that uses the
+  Hermitian symmetry of the kernel and batches all `(omega, n)` pairs of a
+  spectrum into one pass.  Both are `O(Nt^2)`.  No MPI/GPU/NUFFT/FFT, no
+  formation-length windowing, no importance sampling.
+  **单粒子**，FP64，直接梯形双时间积分。两个后端计算同一个双重求和：分块 **numpy**
+  参考路径，以及并行 **numba** 路径（numba 可导入时为默认），后者利用核的厄米对称性并把
+  一个谱的全部 `(omega, n)` 对合并为一次遍历。两者都是 `O(Nt^2)`。无 MPI/GPU/NUFFT/FFT，
+  无形成长度窗口，无重要性采样。
 * **Spin averaged, polarization summed** (the `Parameters` dataclass records
   this).  Resolved spin/polarization is out of scope.
   **自旋平均、极化求和**（`Parameters` 数据类记录此约定）。分辨自旋/极化不在范围内。
@@ -74,6 +87,19 @@ obtained by quadrature over a cone of directions around the initial velocity.
   速度（点积）核已自带 `-1` 真空项，故为默认选择；严格迹核仍含裸接触项，仅用于
   交叉检验。记录端点突变会留下边界辐射，因此短记录的直线并非*恰好*为零 —— 随记录
   变长而趋于零（见 `validation.py`）。
+* **Closed orbits and harmonics**: on a closed orbit the one-turn BK double
+  integral is free of truncation terms only at the *recoil-shifted* harmonics
+  `omega_m = m Omega / (1 + m Omega/eps)` (periodicity is set by
+  `omega eps/eps'`); evaluating at the bare `m Omega` leaves an
+  `O(m omega/eps)` artifact.  The code's one-turn `dE/domega` at `omega_m` is
+  directly the continuum spectral density `T dP/domega` (no Jacobian), which is
+  how `validation.py` V8 compares it with the exact constant-field quantum
+  synchrotron spectrum (`reference.py`).
+  **闭合轨道与谐波**：闭合轨道上，一圈的 BK 双重积分只有在*反冲移动*谐波
+  `omega_m = m Omega / (1 + m Omega/eps)` 处才没有截断项（周期性由 `omega eps/eps'`
+  决定）；在裸 `m Omega` 处评估会留下 `O(m omega/eps)` 的伪影。代码一圈的 `dE/domega`
+  在 `omega_m` 处直接就是连续谱密度 `T dP/domega`（无雅可比因子），`validation.py` V8
+  即以此与恒定场量子同步辐射精确谱（`reference.py`）比较。
 * **Classical limit**: as `w/eps -> 0` the BK single-particle spectrum reduces
   to the classical Liénard–Wiechert trajectory spectrum (eq. 7.4), *not* to a
   multi-particle coherent LW total field.
@@ -93,14 +119,18 @@ obtained by quadrature over a cone of directions around the initial velocity.
 
 ## This is a reference implementation / 这是一个参考实现
 
-It is **not** performance-optimized.  Do not benchmark it, and do not claim it
-is faster than LCFA or LW.  Its purpose is to pin down units, phases, recoil,
-positivity and the classical limit before any optimization (per
+The numpy path is deliberately slow and explicit; the numba path is a
+straightforward parallel evaluation of the *same* `O(Nt^2)` double sum (no
+windowing, no FFT), so it makes the reference method usable for
+`Nt ~ 10^4` records but does not change its scaling.  Do not claim it is
+faster than LCFA or LW.  Its purpose is to pin down units, phases, recoil,
+positivity and the classical limit before any algorithmic optimization (per
 `Baier-Katkov-multiparticle.md` sec. 15, phase 1).
 
-它**未**做性能优化。不要对它做基准测试，也不要声称它比 LCFA 或 LW 更快。其目的是
-在任何优化之前先钉牢单位、相位、反冲、正性与经典极限（按
-`Baier-Katkov-multiparticle.md` 第 15 节第 1 阶段）。
+numpy 路径刻意保持慢而显式；numba 路径只是对*同一个* `O(Nt^2)` 双重求和的直接并行求值
+（无窗口、无 FFT），它让参考方法能处理 `Nt ~ 10^4` 的记录，但不改变其复杂度标度。
+不要声称它比 LCFA 或 LW 更快。其目的是在任何算法优化之前先钉牢单位、相位、反冲、正性
+与经典极限（按 `Baier-Katkov-multiparticle.md` 第 15 节第 1 阶段）。
 
 ## Files / 文件
 
@@ -111,10 +141,12 @@ baier_katkov/
 ├── types.py           Trajectory, Parameters, Spectrum dataclasses / 数据类
 ├── trajectory.py      linear interpolation of discrete trajectory samples / 离散轨迹样本线性插值
 ├── phase.py           double-time recoil phase, relative anchoring / 双时间反冲相位、相对锚定
-├── kernel.py          trace / dot kernels, classical amplitude, Airy identity / 迹/点积核、经典振幅、Airy 恒等式
-├── integrator.py      direct double-time integration -> dW/domega / 直接双时间积分
+├── kernel.py          trace / dot kernels (identical on shell), classical amplitude, Airy identity / 迹/点积核（在壳恒等）、经典振幅、Airy 恒等式
+├── integrator.py      direct double-time integration (numpy reference + numba backend) -> dW/domega / 直接双时间积分（numpy 参考 + numba 后端）
+├── reference.py       exact constant-field quantum synchrotron spectrum, recoil-shifted harmonics / 恒定场量子同步辐射精确谱、反冲移动谐波
 ├── result.py          print / save spectrum / 打印 / 保存谱
-├── validation.py      coarse sanity checks (V1..V7) / 粗粒度 sanity 检查（V1..V7）
+├── validation.py      coarse sanity checks (V1..V8) / 粗粒度 sanity 检查（V1..V8）
+├── validation_plot.py static summary figure of V1..V8 / V1..V8 汇总图
 └── examples/
     └── bk_single_particle.py   minimal end-to-end example / 最小端到端示例
 ```
@@ -135,12 +167,13 @@ python -m lambdapic.core.qed.baier_katkov.validation
 
 The three commands above work once `lambdapic` is installed (which also pulls in
 the full simulation stack via the package's top-level `__init__.py`).  Because
-this subpackage is decoupled and needs only `numpy` + `scipy`, it can also be
-run **standalone** without importing the rest of `lambdapic`:
+this subpackage is decoupled and needs only `numpy` + `scipy` (+ `numba` for
+the fast backend; without it the numpy path is used), it can also be run
+**standalone** without importing the rest of `lambdapic`:
 
 上述三条命令在 `lambdapic` 安装后即可工作（安装同时会经包顶层 `__init__.py` 引入
-完整模拟栈）。由于本子包已解耦、仅依赖 `numpy` + `scipy`，它也可以**独立**运行，
-无需导入 `lambdapic` 的其余部分：
+完整模拟栈）。由于本子包已解耦、仅依赖 `numpy` + `scipy`（快速后端另需 `numba`，
+缺失时回退到 numpy 路径），它也可以**独立**运行，无需导入 `lambdapic` 的其余部分：
 
 ```bash
 PYTHONPATH=src python - <<'PY'

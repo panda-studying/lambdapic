@@ -6,25 +6,35 @@ amplitude used as a soft-photon reference (eq. 7.4).
 
 Two kernel forms are provided:
 
-* :func:`trace_kernel` -- the strict trace form (eq. 7.1)
-  ``N12 = -(m^2/(eps eps')) [1 + ((eps^2 + eps'^2)/(4 m^2)) (b1 - b2)^2]``.
+* :func:`trace_kernel` -- the trace form (eq. 7.1)
+  ``N12 = -m^2/(eps eps') - ((eps^2 + eps'^2)/(4 eps'^2)) (b1 - b2)^2``.
 * :func:`dot_kernel` -- the velocity / dot-product form (eq. 7.3)
   ``Ndot = [(eps^2 + eps'^2)(b1 . b2 - 1) + omega^2/gamma^2] / (2 eps'^2)``.
 
-**Relationship (a controlled rewrite, not an identity).**  The two forms are
-connected by ``(b1 - b2)^2 = b1^2 + b2^2 - 2 b1.b2`` together with
-``b_i^2 = 1 - m^2/eps_i^2`` and the *local-energy* replacement
-``eps1 ~ eps2 ~ eps``, ``eps1' ~ eps2' ~ eps'`` (sec. 7.3).  This is a
-soft-photon / high-energy / equal-energy rewrite; the two kernels therefore
-agree up to ``O(omega)`` terms and are **not** equal as pointwise functions of
-two distinct times.  In the classical limit ``omega/eps -> 0`` both reduce to
-``b1 . b2 - 1``, which equals the classical transverse-velocity kernel
-``n x (n x b1) . n x (n x b2)`` up to total-derivative (boundary) terms.
+**Relationship (an exact on-shell identity).**  With
+``(b1 - b2)^2 = b1^2 + b2^2 - 2 b1.b2`` and ``b_i^2 = 1 - m^2/eps^2`` for
+two samples of the same on-shell energy ``eps`` (``gamma = eps/m``), the
+constant pieces combine to ``m^2 (eps - eps')^2 / (2 eps^2 eps'^2)
+= omega^2 / (2 eps'^2 gamma^2)`` and the two forms are *pointwise identical*.
+They differ only once the two times carry different local energies
+``eps1 != eps2`` (the sec. 4.2 generalization), where the trace form with
+``b_i^2 = 1 - m^2/eps_i^2`` is the fundamental one.  In the classical limit
+``omega/eps -> 0`` both reduce to ``b1 . b2 - 1``, which equals the classical
+transverse-velocity kernel ``n x (n x b1) . n x (n x b2)`` up to
+total-derivative (boundary) terms.
 
-The **trace form still contains the vacuum/contact ``1`` term**; directly
-integrating it on a finite record therefore needs explicit endpoint /
-vacuum subtraction.  The **dot form has that subtraction already folded into
-its ``-1``**, so it is the default for numerical work on finite records.
+Validation history: an earlier transcription of the trace form carried the
+coefficient ``(eps^2 + eps'^2)/(4 m^2)`` inside ``-m^2/(eps eps') [1 + ...]``,
+i.e. ``(eps^2 + eps'^2)/(4 eps eps')`` instead of ``(eps^2 + eps'^2)/(4 eps'^2)``
+-- one factor ``eps/eps'`` short.  Against the exact constant-field quantum
+synchrotron spectrum (validation V8) that version fell below the exact
+result by ~``(1 - omega/eps)`` while the dot form agreed to 0.1%; the
+coefficient above restores the identity.
+
+Both forms carry the vacuum subtraction: the ``-1`` of the dot form and the
+``-m^2/(eps eps')`` contact term of the trace form are the same thing, so
+neither needs an explicit endpoint / vacuum subtraction beyond what a closed
+or windowed record already provides.
 """
 
 from __future__ import annotations
@@ -32,10 +42,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.special import airy
 
-from .units import fine_structure
-
 __all__ = [
-    "fine_structure",
     "trace_kernel",
     "dot_kernel",
     "classical_velocity_kernel",
@@ -51,16 +58,18 @@ def _eps_prime(epsilon, omega, epsilon_prime=None):
 
 
 def trace_kernel(beta1, beta2, epsilon, omega, mass=1.0, epsilon_prime=None):
-    """Strict trace kernel ``N12`` of eq. 7.1 (spin-averaged, pol.-summed).
+    """Trace kernel ``N12`` of eq. 7.1 (spin-averaged, pol.-summed).
 
+    ``N12 = -m^2/(eps eps') - (eps^2 + eps'^2)/(4 eps'^2) (b1 - b2)^2``.
     ``epsilon_prime`` defaults to ``epsilon - omega``; pass
-    ``epsilon_prime=epsilon`` for the recoilless (classical) limit.
+    ``epsilon_prime=epsilon`` for the recoilless (classical) limit.  On shell
+    (``|b_i|^2 = 1 - m^2/eps^2``) this is identical to :func:`dot_kernel`.
     """
     eps_p = _eps_prime(epsilon, omega, epsilon_prime)
     db2 = np.sum((np.asarray(beta1) - np.asarray(beta2)) ** 2, axis=-1)
-    return -(mass ** 2 / (epsilon * eps_p)) * (
-        1.0 + ((epsilon ** 2 + eps_p ** 2) / (4.0 * mass ** 2)) * db2
-    )
+    return -(mass ** 2 / (epsilon * eps_p)) - (
+        (epsilon ** 2 + eps_p ** 2) / (4.0 * eps_p ** 2)
+    ) * db2
 
 
 def dot_kernel(beta1, beta2, epsilon, omega, mass=1.0, epsilon_prime=None):

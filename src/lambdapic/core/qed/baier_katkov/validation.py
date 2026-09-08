@@ -15,8 +15,12 @@ precision).  They validate, in order:
 * V5  a straight, uniform trajectory gives (near) zero radiation and BK agrees
   with LW;
 * V6  positivity of the angle-integrated ``dW/domega`` example spectrum;
-* V7  the controlled rewrite: ``dot_kernel`` and ``trace_kernel`` coincide in
-  the soft limit (eq. 7.3 vs eq. 7.1).
+* V7  the trace and dot kernels are the same function on shell (eq. 7.1 vs
+  eq. 7.3);
+* V8  the quantum regime: the one-turn BK spectrum of a synchrotron circle
+  at the recoil-shifted harmonics reproduces the exact constant-field quantum
+  synchrotron spectrum (Baier--Katkov / Sokolov--Ternov, ``K_{1/3}``,
+  ``K_{2/3}``; the same formula behind the LCFA tables in ``core/qed``).
 
 Run::
 
@@ -30,7 +34,8 @@ from scipy.integrate import quad
 from scipy.special import airy, kv, roots_legendre
 
 from . import kernel as K
-from .integrator import (classical_d2_energy, cone_directions, d2_energy,
+from . import reference as R
+from .integrator import (BKIntegrator, classical_d2_energy, d2_energy,
                          double_time_integral)
 from .types import Parameters, Trajectory
 from .units import fine_structure
@@ -102,6 +107,17 @@ def straight_trajectory(gamma, T=100.0, n_samples=256):
     return Trajectory(time=t, position=r, momentum=u, mass=1.0, charge=1.0)
 
 
+def harmonics_for_deltas(deltas, Omega, epsilon):
+    """Harmonic indices ``m`` whose recoil-shifted line lies closest to ``delta * epsilon``.
+
+    The BK one-turn integral is periodic when ``omega eps/eps' = m Omega``; with
+    ``omega = delta eps`` this gives ``m = delta/(1 - delta) * eps/Omega``.
+    """
+    deltas = np.atleast_1d(np.asarray(deltas, dtype=np.float64))
+    m = np.rint(deltas / (1.0 - deltas) * epsilon / Omega).astype(int)
+    return np.maximum(m, 1)
+
+
 # --------------------------------------------------------------------------
 # V2: |classical amplitude|^2 == velocity-kernel double integral
 # --------------------------------------------------------------------------
@@ -129,27 +145,28 @@ def check_classical_limit():
     traj, _, Omega = circle_trajectory(gamma=gamma, rho=200.0, n_samples=512)
     eps = gamma
 
-    # Soft-photon BK -> LW holds on a *closed* orbit evaluated at the synchrotron
-    # harmonics omega = m Omega, where the hard-truncation boundary terms of the
-    # double-time integral vanish.  Angle-integrate over the full sphere using
-    # Gauss--Legendre in cos(theta) (the orbit is azimuthally symmetric about the
-    # z-axis, so only theta matters).  omega/eps << 1 -> BK/LW ratio -> 1.
-    x, wx = roots_legendre(8)
-    theta = np.arccos(x)
+    # Soft-photon BK -> LW holds on a *closed* orbit where the hard-truncation
+    # boundary terms of the double-time integral vanish.  For LW that is at the
+    # harmonics omega = m Omega; for BK the one-turn integrand is periodic only
+    # at the *recoil-shifted* harmonics omega_m = m Omega / (1 + m Omega/eps)
+    # (the periodicity is set by omega eps/eps').  Evaluating BK at the bare
+    # m Omega leaves an O(m omega/eps) truncation artifact, which is reported as
+    # ``ratio_bare`` to document it.  Angle-integrate over the full sphere (the
+    # orbit is azimuthally symmetric about z).  omega/eps << 1 -> ratio -> 1.
+    dirs, wts = R.orbit_direction_grid(gamma, n_inner=16, n_outer=8)
+    bk = BKIntegrator(traj, Parameters(epsilon=eps, kernel="dot"))
 
     rows = []
     for m in [1, 2, 3, 4]:
-        omega = m * Omega
-        lw = 0.0
-        bk = 0.0
-        for th, wj in zip(theta, wx):
-            n = np.array([np.sin(th), 0.0, np.cos(th)])
-            lw += wj * classical_d2_energy(traj.time, traj.position, traj.beta(),
-                                           omega, n)
-            bk += wj * d2_energy(traj.time, traj.position, traj.beta(), omega, n,
-                                 epsilon=eps, kernel="dot", phase="recoil")
-        rows.append(dict(m=m, omega=omega, omega_over_eps=omega / eps, lw=lw, bk=bk,
-                         ratio=bk / lw))
+        om_bare = m * Omega
+        om_shift = float(R.recoil_shifted_harmonic(m, Omega, eps))
+        lw = sum(w * classical_d2_energy(traj.time, traj.position, traj.beta(), om_bare, n)
+                 for n, w in zip(dirs, wts))
+        bk_shift = float(bk.d2_energy_batch([om_shift], dirs)[0] @ wts)
+        bk_bare = float(bk.d2_energy_batch([om_bare], dirs)[0] @ wts)
+        rows.append(dict(m=m, omega=om_shift, omega_over_eps=om_shift / eps, lw=lw,
+                         bk=bk_shift, bk_bare=bk_bare, ratio=bk_shift / lw,
+                         ratio_bare=bk_bare / lw))
     return rows
 
 
@@ -162,26 +179,25 @@ def check_larmor():
     n_samples = 4000
     traj, beta, Omega = circle_trajectory(gamma=gamma, rho=rho, n_samples=n_samples)
 
-    # Heaviside--Lorentz Larmor total power  P = (2/3) e^2 gamma^4 beta^4 / rho^2
-    # with e^2 = 4 pi alpha  ->  P = (8 pi / 3) alpha gamma^4 beta^4 / rho^2.
-    # This matches the (alpha/pi) prefactor of classical_d2_energy (eq. 7.4).
+    # Larmor total power in Gaussian natural units (e^2 = alpha, hbar = c = 1):
+    #     P = (2/3) alpha gamma^4 beta^4 / rho^2
+    # (equivalently e_HL^2/(6 pi) with e_HL^2 = 4 pi alpha).  This is the
+    # normalization behind the 88.5 keV * E[GeV]^4 / rho[m] energy loss per
+    # turn, and it matches the (alpha/(4 pi^2)) prefactor of
+    # classical_d2_energy (eq. 7.4 / Jackson 14.67).
     w_c = 1.5 * gamma ** 3 * Omega
-    P = (8.0 * np.pi / 3.0) * fine_structure * gamma ** 4 * beta ** 4 / rho ** 2
+    P = (2.0 / 3.0) * fine_structure * gamma ** 4 * beta ** 4 / rho ** 2
     T = 2.0 * np.pi / Omega
     E_larmor = P * T
 
-    # (a) closure: the exact HL synchrotron spectrum
-    #     dP/dw = 2 sqrt(3) (alpha gamma beta / rho) F(w / w_c),
+    # (a) closure: the exact (Schwinger) synchrotron spectrum
+    #     dP/dw = (sqrt3 / 2 pi) (alpha gamma beta / rho) F(w / w_c),
     #     F(x) = x int_x^inf K_{5/3}(xi) dxi
     #     integrates to the Larmor power (a pure math identity, independent of the
     #     trajectory integrator).  This fixes the absolute normalization.
-    def synch_F(x):
-        val, _ = quad(lambda xi: kv(5.0 / 3.0, xi), x, np.inf, limit=200)
-        return x * val
-
     def dP_dw(w):
-        return 2.0 * np.sqrt(3.0) * (fine_structure * gamma * beta / rho) * \
-            synch_F(w / w_c)
+        return (np.sqrt(3.0) / (2.0 * np.pi)) * (fine_structure * gamma * beta / rho) * \
+            R.synchrotron_F(w / w_c)
 
     w_grid = np.geomspace(0.02 * w_c, 20.0 * w_c, 400)
     P_num = np.trapezoid([dP_dw(w) for w in w_grid], w_grid)
@@ -221,7 +237,7 @@ def check_straight_line():
     n = np.array([0.0, 0.2, np.sqrt(1.0 - 0.2 ** 2)])
 
     # Reference scale: a curved (synchrotron) trajectory at the same (moderate)
-    # frequency, where its emission is O(1e3) in these units.  A straight line
+    # frequency, where its emission is O(1e2) in these units.  A straight line
     # must emit orders of magnitude less.  omega is kept small enough that the
     # record is well resolved (omega * dt << 1), so this is a genuine check and
     # not an aliasing artifact.
@@ -242,16 +258,17 @@ def check_straight_line():
 # --------------------------------------------------------------------------
 def check_positivity():
     # Full synchrotron circle, angle-integrated over the full sphere at the
-    # harmonics omega = m Omega: a physical, boundary-free configuration whose
-    # angle-integrated dW/domega must be strictly positive (and match LW in the
-    # soft limit).  A quarter-arc at non-harmonic frequencies shows spurious
-    # negatives from the hard-truncated record endpoints; here the closed orbit
-    # removes those boundary terms, so positivity is a real check, not a clip.
+    # recoil-shifted harmonics omega_m = m Omega / (1 + m Omega/eps): a
+    # physical, boundary-free configuration whose angle-integrated dW/domega
+    # must be strictly positive (and match LW in the soft limit).  A quarter-arc
+    # at non-harmonic frequencies shows spurious negatives from the
+    # hard-truncated record endpoints; here the closed orbit removes those
+    # boundary terms, so positivity is a real check, not a clip.
     gamma = 10.0
     traj, _, Omega = circle_trajectory(gamma=gamma, rho=200.0, n_samples=512)
     params = Parameters(epsilon=gamma)
     M = 8
-    omega_grid = np.array([m * Omega for m in range(1, M + 1)])
+    omega_grid = R.recoil_shifted_harmonic(np.arange(1, M + 1), Omega, gamma)
     from .integrator import compute_spectrum
     spec = compute_spectrum(traj, params, omega_grid,
                             theta_max=np.pi, n_theta=16, n_phi=1,
@@ -263,16 +280,16 @@ def check_positivity():
 
 
 # --------------------------------------------------------------------------
-# V7: dot vs trace kernels in the soft limit (controlled rewrite)
+# V7: dot and trace kernels are the same function on shell
 # --------------------------------------------------------------------------
 def check_kernel_rewrite():
-    # The rewrite (b1-b2)^2 = b1^2 + b2^2 - 2 b1.b2 with b_i^2 = 1 - m^2/eps_i^2
-    # only holds for on-shell velocities, i.e. |beta| = sqrt(1 - 1/gamma^2) with
-    # gamma = eps / m.  Use on-shell beta vectors so the dot and trace kernels
-    # agree up to O(omega) terms (the local-energy rewrite of sec. 7.3).
+    # (b1-b2)^2 = b1^2 + b2^2 - 2 b1.b2 with b_i^2 = 1 - m^2/eps^2 makes the
+    # trace form pointwise identical to the dot form for on-shell velocities of
+    # one energy, at *any* omega (the constant pieces combine to
+    # omega^2/(2 eps'^2 gamma^2)).  Checked at a hard photon, omega/eps = 0.7.
     rng = np.random.default_rng(0)
     eps = 10.0
-    omega = 1e-3  # soft
+    omega = 7.0
     beta = np.sqrt(1.0 - 1.0 / eps ** 2)
     u1 = rng.normal(size=(5, 3))
     u1 /= np.linalg.norm(u1, axis=1, keepdims=True)
@@ -283,7 +300,88 @@ def check_kernel_rewrite():
     ndot = K.dot_kernel(beta1, beta2, eps, omega)
     ntrace = K.trace_kernel(beta1, beta2, eps, omega)
     rel = np.max(np.abs(ndot - ntrace) / np.abs(ntrace))
-    return dict(rel_err=rel, ok=rel < 1e-2)
+    return dict(rel_err=rel, ok=rel < 1e-12)
+
+
+# --------------------------------------------------------------------------
+# V8: exact quantum synchrotron spectrum on a closed circle (constant field)
+# --------------------------------------------------------------------------
+def check_quantum_synchrotron(gamma=10.0, chi=0.5, deltas=(0.05, 0.1, 0.2, 0.3, 0.5),
+                              n_samples=None, sampling_factor=2.0,
+                              kernels=("dot", "trace"), n_inner=24, n_outer=8,
+                              include_bare=False, backend="auto"):
+    """One-turn BK spectrum at the recoil-shifted harmonics vs the exact LCFA spectrum.
+
+    For uniform circular motion the field along the trajectory is exactly
+    constant, so the constant-field quantum synchrotron formula
+    (:func:`reference.quantum_synchrotron_rate`) is the analytic evaluation of
+    the very double-time integral the module computes.  The code's one-turn
+    angle-integrated ``dE/domega`` at ``omega_m = m Omega / (1 + m Omega/eps)``
+    is compared with ``T * dP/domega`` (see :mod:`.reference` for why no
+    Jacobian appears).  The residual is the finite-``gamma`` error of the
+    ultra-relativistic reference, ``O(1/gamma^2)``.
+
+    Parameters
+    ----------
+    gamma, chi : float
+        electron energy and quantum parameter; the circle radius follows as
+        ``rho = gamma^2 beta^2 / chi``.
+    deltas : sequence
+        target photon energy fractions ``omega/eps``; each is snapped to the
+        nearest recoil-shifted harmonic.
+    n_samples : int, optional
+        samples per turn.  Default ``sampling_factor * 2 m_max``: the fastest
+        phase rate in the double integral is ``2 omega eps/eps' = 2 m Omega``
+        (velocity anti-parallel to ``n``), and the trapezoid sum aliases once
+        ``2 m Omega dt > 2 pi``, i.e. it needs ``N_t > 2 m``.
+    kernels : sequence of ``"dot"`` / ``"trace"``.
+    include_bare : bool
+        also evaluate the dot kernel at the *bare* harmonics ``m Omega`` to
+        expose the truncation artifact (only where ``m Omega < eps``).
+    """
+    beta = np.sqrt(1.0 - 1.0 / gamma ** 2)
+    rho = gamma ** 2 * beta ** 2 / chi
+    chi = R.circle_chi(gamma, rho)
+    Omega = beta / rho
+    T = 2.0 * np.pi / Omega
+
+    m = harmonics_for_deltas(deltas, Omega, gamma)
+    omega = R.recoil_shifted_harmonic(m, Omega, gamma)
+    delta = omega / gamma
+    if n_samples is None:
+        n_samples = int(np.ceil(sampling_factor * 2.0 * m.max()))
+
+    traj, _, _ = circle_trajectory(gamma=gamma, rho=rho, n_samples=n_samples)
+    dirs, wts = R.orbit_direction_grid(gamma, n_inner=n_inner, n_outer=n_outer)
+
+    ref_q = T * delta * R.quantum_synchrotron_rate(delta, chi, gamma)
+    ref_c = T * delta * R.classical_synchrotron_rate(delta, chi, gamma)
+
+    code = {}
+    ratio = {}
+    for kernel in kernels:
+        bk = BKIntegrator(traj, Parameters(epsilon=gamma, kernel=kernel), backend=backend)
+        dE = bk.d2_energy_batch(omega, dirs) @ wts
+        code[kernel] = dE
+        ratio[kernel] = dE / ref_q
+
+    out = dict(gamma=gamma, chi=chi, rho=rho, Omega=Omega, T=T, m=m, delta=delta,
+               omega=omega, n_samples=n_samples, n_dirs=int(len(wts)),
+               ref_quantum=ref_q, ref_classical=ref_c,
+               quantum_over_classical=ref_q / ref_c, code=code, ratio=ratio)
+
+    if include_bare:
+        om_bare = m * Omega
+        ok = om_bare < 0.95 * gamma
+        bare_ratio = np.full(len(m), np.nan)
+        if np.any(ok):
+            bk = BKIntegrator(traj, Parameters(epsilon=gamma, kernel="dot"), backend=backend)
+            dE_bare = bk.d2_energy_batch(om_bare[ok], dirs) @ wts
+            d_bare = om_bare[ok] / gamma
+            ref_bare = T * d_bare * R.quantum_synchrotron_rate(d_bare, chi, gamma)
+            bare_ratio[ok] = dE_bare / ref_bare
+        out["bare_ratio"] = bare_ratio
+    return out
 
 
 def main():
@@ -299,10 +397,11 @@ def main():
           f"{'OK' if v2['ok'] else 'FAIL'}")
 
     v3 = check_classical_limit()
-    print("[V3] soft-photon BK -> LW (closed circle, harmonics):")
+    print("[V3] soft-photon BK -> LW (closed circle):")
     for r in v3:
         print(f"     m={r['m']}  omega/eps={r['omega_over_eps']:.5f}  "
-              f"BK/LW ratio={r['ratio']:.5f}")
+              f"BK/LW at shifted harmonic={r['ratio']:.5f}  "
+              f"(at bare m*Omega: {r['ratio_bare']:.5f}, truncation artifact)")
 
     v4 = check_larmor()
     print(f"[V4] Larmor normalization: exact-spectrum closure={v4['closure']:.4f}")
@@ -319,15 +418,22 @@ def main():
     print(f"[V6] positivity: min(dW/domega)={v6['min_dW']:.3e}  total_W={v6['total_W']:.3e}")
 
     v7 = check_kernel_rewrite()
-    print(f"[V7] dot~trace soft-limit rewrite: rel_err={v7['rel_err']:.2e} "
+    print(f"[V7] trace == dot kernel on shell (omega/eps=0.7): rel_err={v7['rel_err']:.2e} "
           f"{'OK' if v7['ok'] else 'FAIL'}")
+
+    v8 = check_quantum_synchrotron()
+    print(f"[V8] quantum synchrotron (gamma={v8['gamma']:.0f}, chi={v8['chi']:.2f}, "
+          f"N_t={v8['n_samples']}, {v8['n_dirs']} dirs):")
+    print("     delta            :", " ".join(f"{d:7.4f}" for d in v8['delta']))
+    print("     quantum/classical:", " ".join(f"{r:7.4f}" for r in v8['quantum_over_classical']))
+    for kernel, r in v8['ratio'].items():
+        print(f"     BK {kernel:5s}/quantum :", " ".join(f"{x:7.4f}" for x in r))
 
     print("=" * 60)
     print("V1/V2/V7 are exact internal/analytic checks; V3/V4/V5 are physical "
-          "coarse checks; V6 is a diagnostic.  The full quantum synchrotron "
-          "spectrum (K_{1/3},K_{2/3}, eq. 10.3) is NOT numerically verified here: "
-          "its prefactor P(epsilon,chi) is convention-dependent and would need a "
-          "separate, carefully normalized local-constant-field reference.")
+          "coarse checks; V6 is a diagnostic; V8 pins the quantum regime "
+          "(recoil phase, (eps^2+eps'^2)/2eps'^2 prefactor, omega^2/gamma^2 "
+          "term) against the exact constant-field spectrum to O(1/gamma^2).")
 
 
 if __name__ == "__main__":

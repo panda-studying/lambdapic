@@ -43,10 +43,16 @@ def recoil_frequency(omega, epsilon, epsilon_prime=None):
 
     ``epsilon'`` defaults to ``epsilon - omega``.  This is *not* a change of
     the photon frequency; it is the rescaling of the phase inside the
-    formation-length integral (eq. 5.3).
+    formation-length integral (eq. 5.3).  Requires ``epsilon' > 0``, i.e.
+    ``omega < epsilon`` in the BK recoil convention.
     """
     if epsilon_prime is None:
         epsilon_prime = epsilon - omega
+    if np.any(np.asarray(epsilon_prime, dtype=np.float64) <= 0.0):
+        raise ValueError(
+            "epsilon' must be positive (got epsilon' = "
+            f"{epsilon_prime} for omega = {omega}, epsilon = {epsilon})"
+        )
     return omega * epsilon / epsilon_prime
 
 

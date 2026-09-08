@@ -44,6 +44,10 @@ class Trajectory:
     def __post_init__(self) -> None:
         self.time = np.asarray(self.time, dtype=np.float64)
         self.position = np.asarray(self.position, dtype=np.float64)
+        if self.time.ndim != 1:
+            raise ValueError("time must be 1-D")
+        if self.time.shape[0] < 2:
+            raise ValueError("at least two time samples are required")
         if self.position.ndim != 2 or self.position.shape[1] != 3:
             raise ValueError("position must have shape (Nt, 3)")
         if self.time.shape[0] != self.position.shape[0]:
@@ -117,9 +121,10 @@ class Parameters:
         ``epsilon' = epsilon`` and a unit recoil factor, i.e. the classical
         phase (useful for cross-checking the soft-photon limit).
     kernel:
-        ``"dot"`` (velocity form, eq. 7.3 of `Baier-Katkov.md`, the default
-        for numerical work) or ``"trace"`` (strict trace form, eq. 7.1).
-        See :mod:`.kernel` for the relationship between the two.
+        ``"dot"`` (velocity form, eq. 7.3 of `Baier-Katkov.md`, the default)
+        or ``"trace"`` (trace form, eq. 7.1).  The two are pointwise identical
+        on shell (validation V7) and both reproduce the exact quantum
+        synchrotron spectrum (validation V8); see :mod:`.kernel`.
     """
 
     epsilon: float
@@ -135,12 +140,21 @@ class Parameters:
             raise ValueError("recoil must be 'baier_katkov' or 'classical'")
         if self.kernel not in ("dot", "trace"):
             raise ValueError("kernel must be 'dot' or 'trace'")
+        if not self.spin_averaged or not self.polarization_summed:
+            raise NotImplementedError(
+                "only spin-averaged, polarization-summed kernels are implemented"
+            )
 
     def epsilon_prime(self, omega) -> np.ndarray:
         """Final-state energy label ``epsilon'`` for photon energy ``omega``."""
         omega = np.asarray(omega, dtype=np.float64)
         if self.recoil == "classical":
             return np.full_like(omega, self.epsilon, dtype=np.float64)
+        if np.any(omega >= self.epsilon):
+            raise ValueError(
+                "omega must be < epsilon "
+                "(epsilon' = epsilon - omega must be positive)"
+            )
         return self.epsilon - omega
 
     def recoil_factor(self, omega) -> np.ndarray:
@@ -181,6 +195,8 @@ class Spectrum:
             self.dE_domega = np.asarray(self.dE_domega, dtype=np.float64)
         if self.omega.shape != self.dW_domega.shape:
             raise ValueError("omega and dW_domega must have the same shape")
+        if self.dE_domega is not None and self.dE_domega.shape != self.omega.shape:
+            raise ValueError("dE_domega must have the same shape as omega")
 
     def total_probability(self) -> float:
         """Integrated emission probability ``W = int domega dW/domega``."""
