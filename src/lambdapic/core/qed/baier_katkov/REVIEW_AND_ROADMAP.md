@@ -130,9 +130,18 @@ $$ \frac{d^2E}{d\omega\, d\Omega} = \frac{\alpha}{\pi}\,\omega^2 q^2\,\mathrm{Re
 
 $\gamma$ 从 10 到 20 时残差由 0.3% 降到 0.07%，符合参照公式本身的 $O(1/\gamma^2)$ 精度；角度网格 (24,8) 与 (48,16)、$N_t$ 6000 与 12000 结果到 4 位相同（已收敛）。**反冲相位、前因子、$\omega^2/\gamma^2$ 项全部正确**；同时发现并修正了 trace 核抄写错误（BUG-6）。参照公式本身经三重锚定：Macdonald 形式 ≡ Airy 形式 ≡ 项目 LCFA 表 `gen_photon_prob_rate_for_delta`（≤ 5.5e-6）；$\chi\to0$ → Schwinger 谱；经典功率 ≡ Larmor，量子功率/Larmor 与 BKS 拟合 $g(\chi)$ 相符（≤ 1.4%）。
 
-### P-2：固定入射能量 ε —— 对 PIC 轨迹不成立
+### P-2：固定入射能量 ε —— 对 PIC 轨迹不成立 ✅ 已解决 2026-09-09
 
 整条轨迹使用单一 $\varepsilon$（`Parameters.epsilon`），$N(t_1,t_2)$ 和 $\Phi$ 均如此。PIC 中电子能量沿轨迹随激光场振荡并因辐射损失变化，正确形式是局部能量 $\varepsilon(t_1), \varepsilon(t_2)$（模块自认"sec. 4.2"）。对激光尾场加速（能量变化 $O(1)$）或长记录，固定 ε 会同时错相位和核。
+
+**已实现**：`Trajectory.energy` 可选字段（逐采样 `eps(t)`，正数校验），`Trajectory.local_energy()` 从动量历史恢复 `eps = m·γ`。核与相位切换到逐顶点形式（`kernel.py` 的 `epsilon2` 关键字 + `integrator.py` 的 `energy=` 入口，numpy/numba 双后端）：
+
+- 相位 $\Phi_{ij}=\omega\left[f_j(t_j-\mathbf n\cdot\mathbf r_j)-f_i(t_i-\mathbf n\cdot\mathbf r_i)\right]$，$f_i=\varepsilon_i/\varepsilon'_i$，用差分稳定形式 $\Phi=\omega[\bar f\,\Delta x + \Delta f\,\bar x]$ 求值（$\bar f$、$\Delta f$ 为逐对平均/差，$x=t-\mathbf n\cdot\mathbf r$），能量变化只经小项 $\Delta f$ 进入，保留反演反对称性 → 厄米上三角求和仍成立。
+- 迹核（基本形式）：$N_{ij}=(A_i+A_j)+(B_i+B_j)(\mathbf b_i\cdot\mathbf b_j-1)$，$A_i=-\frac{m^2}{2\varepsilon_i\varepsilon'_i}+\frac{m^2 c_i}{4\varepsilon_i^2}$，$B_i=\frac{c_i}{4}$，$c_i=\frac{\varepsilon_i^2+\varepsilon_i'^2}{\varepsilon_i'^2}$。
+
+**关键发现**：逐顶点反冲 $\varepsilon'_i=\varepsilon_i-\omega$ 下，在壳恒等式 $(\varepsilon_i-\varepsilon'_i)^2=\omega^2$ **逐顶点成立**，故对称化的局域 dot 与 trace 核**严格重合**（回归测试到 $10^{-10}$）。即 kernel.py 文档旧预期"ε1≠ε2 时两核不同"只在一个固定全局 $\varepsilon'$ 的约定下成立；本项目采用 roadmap 的逐顶点 $\varepsilon'_i=\varepsilon_i-\omega$ 约定，两核合一。经典模式（$\varepsilon'_i=\varepsilon_i$，$f=1$）则完全不含能量历史（trace 退化为纯 $\mathbf b_1\cdot\mathbf b_2-1$），已作为"能量无关性"测试固定。**注**：sec. 4.2 局部形式因 `Baier-Katkov.md` 缺失（§3 文档债）而由对称化推导并靠测试钉死（恒能量退化 ≡ 固定路径到 $10^{-16}$；能量变化轨道上谱正性、厄米性、numba≡numpy 到 $10^{-11}$）。
+
+pytest 新增 8 个用例（12 个参数化实例）：`test_local_energy_degenerates_to_fixed`、`_kernels_coincide_on_shell`、`_matches_numpy`、`_is_hermitian`、`_spectrum_positive`、`_classical_is_energy_independent`、`_validation`。固定路径未动，23 例原回归 + 35 例全量 + V1–V8 全部通过。
 
 ### P-3：有限记录边界辐射 —— PIC 应用的拦路虎
 
@@ -204,7 +213,7 @@ $$\frac{dW}{dt\,d\delta} = \frac{\alpha}{\sqrt3\,\pi\,\varepsilon}\left[\left(1-
    等价的 Airy 形式（项目表所用；$z=[\delta/(\chi(1-\delta))]^{2/3}$，$y=\tfrac23 z^{3/2}$）：$\dfrac{dW}{dt\,d\delta}=-\dfrac{\alpha}{\varepsilon}\left[\displaystyle\int_z^\infty\!\mathrm{Ai}(x)dx+\left(\frac2z+\delta\chi\sqrt z\right)\mathrm{Ai}'(z)\right]$，由 $\mathrm{Ai}(z)=\frac1\pi\sqrt{z/3}\,K_{1/3}(y)$、$\mathrm{Ai}'(z)=-\frac{z}{\pi\sqrt3}K_{2/3}(y)$ 及 $2+\delta\chi z^{3/2}=(1-\delta)+\frac1{1-\delta}$ 可证恒等。经典极限 $\chi\to0$ 退化为 Schwinger 谱 $\frac{dP}{d\omega}=\frac{\sqrt3}{2\pi}\frac{\alpha\gamma}{\rho}F(\omega/\omega_c)$、总功率 $\frac23\alpha\chi^2$（V4 与 pytest 已验证此极限）；积分量检验可用 $P=P_{cl}\,g(\chi)$，$g\approx[1+4.8(1+\chi)\ln(1+1.7\chi)+2.44\chi^2]^{-2/3}$。
 
    对接方式：闭合一圈的角积分 $\left.dE/d\omega\right|_{\omega_m}$ 对应 $T\cdot dP/d\omega$（V4 的用法）。**必须在反冲移动后的谐波 $\omega_m = \dfrac{m\Omega}{1+m\Omega/\varepsilon}$ 处评估**：BK 双积分的周期性由 $\omega\varepsilon/\varepsilon'$ 决定，无边界项的条件是 $\omega\varepsilon/\varepsilon'=m\Omega$；在裸 $m\Omega$ 处评估会带入 $\propto m\,\omega/\varepsilon$ 的边界项——V3 中随 $m$ 增长的 0.1%→3% 偏离（远大于 $O(\omega/\varepsilon)=0.2\%$）疑为此伪影而非量子修正，交叉验证时一并澄清。参数：$\rho=\gamma^2/\chi$，$\chi\in\{0.05,0.2,0.5,1\}$，$\delta\in[0.01,0.6]$，$N_t\gtrsim10\,m_c$（$m_c=\tfrac32\gamma^3$，$\gamma=10$ 时 1500）。$\gamma=10$ 的 $1/\gamma^2$ 修正约 1%，足以判定 dot/trace（两者主项差因子 $1-\delta$，$\delta=0.3$ 时差 30%）。
-5. **P-2 局部能量核**：把 $N(t_1,t_2)$、$\Phi$ 推广到 $\varepsilon(t_1),\varepsilon(t_2),\varepsilon'_i = \varepsilon_i - \omega$（迹核形式天然含 $\varepsilon_1\varepsilon_2$ 结构，改动局部化在 kernel.py + phase.py，`Trajectory` 增加可选能量历史字段）；
+5. ✅ **P-2 局部能量核**（2026-09-09 完成）：把 $N(t_1,t_2)$、$\Phi$ 推广到 $\varepsilon(t_1),\varepsilon(t_2),\varepsilon'_i = \varepsilon_i - \omega$（改动在 kernel.py + phase.py + integrator.py + types.py，`Trajectory` 增加可选能量历史字段 `energy`；局部形式由对称化推导、靠测试钉死，详见 §4 P-2）；
 6. **P-3 边界处理**：优先实现形成长度窗口 $W(|t_2-t_1|/l_f)$（兼顾性能），辅以端点绝热开关；用"截断非闭合圆弧 + 与闭合圆环对比"做收敛性检验；
 7. **P-4 自适应锥角** `theta_max(ω)` 或收敛检查。
 
@@ -250,10 +259,10 @@ $$\frac{dW}{dt\,d\delta} = \frac{\alpha}{\sqrt3\,\pi\,\varepsilon}\left[\left(1-
 | ~~P0~~ ✅ | ~~修 BUG-1（recoil 静默忽略）~~ 已完成 2026-09-08 | — | §2 |
 | ~~P0~~ ✅ | ~~修 BUG-2/3/4（校验与守卫）~~ 已完成 2026-09-08 | — | §2 |
 | ~~P0~~ ✅ | ~~修 BUG-5（前因子 4π）+ pytest 回归~~ 已完成 2026-09-08 | — | §2, §7-A |
-| P0 | 补设计文档/文献出处 | 0.5–1 d | §3 |
+| P0 | 补设计文档/文献出处（架构/函数说明已补：README.md 重写为中文详细文档 2026-09-09；剩余：物理推导设计文档 `Baier-Katkov.md` 与文献引用） | 0.5–1 d | §3 |
 | ~~P1~~ ✅ | ~~量子同步辐射交叉验证~~ 已完成 2026-09-08（BK/精确 0.997–1.001；顺带修 BUG-6 trace 核） | — | §4 P-1, §7-B |
 | P1 | 形成长度窗口 + 边界处理 | 1–2 d | §7-B |
-| P2 | 局部能量核 ε(t) | 1–2 d | §7-B |
+| ~~P2~~ ✅ | ~~局部能量核 ε(t)~~ 已完成 2026-09-09（`Trajectory.energy` + 逐顶点核/相位，双后端；固定路径未动） | — | §7-B |
 | ~~P2~~ ✅ | ~~Numba 化~~ 已完成 2026-09-08（约 140×） | — | §5 |
 | P2 | 带状截断（$O(N_t N_\omega)$） | 1–2 d | §7-C |
 | P3 | 单位适配器 + 轨迹记录回调 + 系综求和 | 2–3 d | §7-D |

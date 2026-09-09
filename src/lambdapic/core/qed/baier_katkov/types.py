@@ -28,6 +28,17 @@ class Trajectory:
         Optional ``(Nt, 3)`` array of normalized momentum ``u = gamma beta``.
         When ``None``, ``beta`` is reconstructed by finite-differencing
         ``position`` (with the caveats documented in :mod:`.trajectory`).
+    energy:
+        Optional ``(Nt,)`` history of the local electron energy ``eps(t_i)``
+        (natural units).  When set, the BK integrator switches from the fixed
+        incident energy of :class:`Parameters` to the sec. 4.2 local-energy
+        generalization: the phase and kernel use ``eps(t1), eps(t2)`` with
+        per-vertex recoil ``eps'_i = eps_i - omega``.  On the mass shell the
+        default local energy is ``mass * gamma``; supplying ``energy`` is how
+        one feeds a PIC energy history (accelerating electrons) into the
+        module.  Values must be positive; consistency with ``momentum``
+        (``eps_i = mass * sqrt(1 + |u_i|^2)``) is the caller's responsibility
+        -- the kernel assumes ``|beta_i|^2 = 1 - m^2/eps_i^2``.
     mass:
         Particle mass in natural units (``m_e = 1`` for electrons).
     charge:
@@ -38,6 +49,7 @@ class Trajectory:
     time: np.ndarray
     position: np.ndarray
     momentum: Optional[np.ndarray] = None
+    energy: Optional[np.ndarray] = None
     mass: float = 1.0
     charge: float = 1.0
 
@@ -56,6 +68,12 @@ class Trajectory:
             self.momentum = np.asarray(self.momentum, dtype=np.float64)
             if self.momentum.shape != self.position.shape:
                 raise ValueError("momentum must have shape (Nt, 3)")
+        if self.energy is not None:
+            self.energy = np.asarray(self.energy, dtype=np.float64)
+            if self.energy.shape != (self.time.shape[0],):
+                raise ValueError("energy must have shape (Nt,)")
+            if not np.all(np.isfinite(self.energy)) or np.any(self.energy <= 0.0):
+                raise ValueError("energy values must be finite and positive")
 
     @property
     def n_samples(self) -> int:
@@ -76,6 +94,17 @@ class Trajectory:
             return np.sqrt(1.0 + np.einsum("ij,ij->i", u, u))
         beta = self.beta()
         return 1.0 / np.sqrt(1.0 - np.einsum("ij,ij->i", beta, beta))
+
+    def local_energy(self) -> np.ndarray:
+        """Local electron energy ``eps(t_i)`` at each sample.
+
+        Returns the explicit ``energy`` history when one was supplied;
+        otherwise falls back to the on-shell value ``mass * gamma`` (exact
+        for a trajectory carrying normalized momentum ``u``).
+        """
+        if self.energy is not None:
+            return self.energy
+        return self.mass * self.gamma()
 
 
 def _beta_from_position(time: np.ndarray, position: np.ndarray) -> np.ndarray:
@@ -102,9 +131,12 @@ class Parameters:
     epsilon:
         Incident electron energy (natural units, ``gamma m``).  Used for the
         recoil ``epsilon' = epsilon - omega`` and the recoil phase factor
-        ``epsilon / epsilon'``.  The first version uses a single fixed value;
-        for time-dependent external fields one must instead use a local
-        energy history (see `Baier-Katkov.md` sec. 4.2).
+        ``epsilon / epsilon'``.  This fixed value applies while the
+        :class:`Trajectory` carries no ``energy`` history; for time-dependent
+        external fields (accelerating electrons) supply
+        ``Trajectory.energy`` and the integrator switches to the sec. 4.2
+        local-energy generalization ``eps(t1), eps(t2)``, at which point
+        ``epsilon`` is no longer used by the kernel or phase.
     mass:
         Electron mass in natural units (1).
     charge:

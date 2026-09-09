@@ -34,6 +34,18 @@ Because the double-time kernel obeys ``K(t2, t1) = K(t1, t2)^*`` the integral
 is real.  The numpy path evaluates the full square and keeps the imaginary
 part as a round-off diagnostic; the numba path uses the symmetry explicitly,
 so its imaginary part is zero by construction.
+
+Local energies (sec. 4.2): passing an ``energy`` history ``eps(t)`` to any
+public entry point switches the kernel and phase to the per-vertex forms
+``eps(t1), eps(t2)`` with ``eps'_i = eps_i - omega``.  With this per-vertex
+recoil the on-shell identity ``(eps_i - eps'_i)^2 = omega^2`` holds vertex
+by vertex, so the symmetrized local dot and trace forms still coincide
+exactly (verified to round-off by the regression tests); in the classical
+``eps'_i = eps_i`` mode the trace form drops the ``omega`` contact term and
+is the fundamental one there.  The pair kernel remains symmetric and the
+pair phase antisymmetric under ``1 <-> 2``, so Hermitian symmetry
+(upper-triangle summation) and reality still hold.  The fixed-``eps`` path
+is unchanged and stays the default.
 """
 
 from __future__ import annotations
@@ -166,6 +178,49 @@ def _kernel_coefficients(kernel, omega, epsilon, eps_p, mass):
     return a, b
 
 
+def _local_vertex_arrays(kernel, omega, energy, phase, mass):
+    """Per-(frequency, vertex) arrays ``A, B, f`` of the sec. 4.2 local form.
+
+    The pair kernel is ``N_ij = (A_ki + A_kj) + (B_ki + B_kj) (b_i . b_j - 1)``
+    and the pair phase ``Phi_ij = omega_k [ fbar (x_j - x_i) + df (x_j + x_i)/2 ]``
+    with ``x = t - n.r``, ``fbar = (f_ki + f_kj)/2``, ``df = f_kj - f_ki``.
+
+    ``phase`` selects the per-vertex final-state energy: ``"recoil"`` ->
+    ``eps'_i = eps_i - omega_k`` (BK); ``"classical"`` -> ``eps'_i = eps_i``
+    (recoilless, ``f = 1``).  Per-vertex coefficients (see :mod:`.kernel`):
+
+    * trace: ``A_i = -m^2/(2 eps_i eps'_i) + m^2 c_i/(4 eps_i^2)``,
+      ``B_i = c_i/4``;
+    * dot: ``A_i = m^2 omega_k^2/(4 eps_i^2 eps'_i^2)``, ``B_i = c_i/4``;
+
+    with ``c_i = (eps_i^2 + eps'_i^2)/eps'_i^2``.  Returns arrays of shape
+    ``(N_omega, Nt)``.
+    """
+    omega = np.atleast_1d(np.asarray(omega, dtype=np.float64))
+    energy = np.asarray(energy, dtype=np.float64)
+    if phase == "recoil":
+        if np.any(omega[:, None] >= energy[None, :]):
+            raise ValueError(
+                "omega must be < eps(t) at every sample (the per-vertex "
+                "final-state energy eps' = eps(t) - omega must be positive)"
+            )
+        epsp = energy[None, :] - omega[:, None]
+        f = energy[None, :] / epsp
+    elif phase == "classical":
+        epsp = np.broadcast_to(energy, (omega.shape[0], energy.shape[0]))
+        f = np.ones_like(epsp)
+    else:
+        raise ValueError("phase must be 'recoil' or 'classical'")
+    c = (energy[None, :] ** 2 + epsp ** 2) / epsp ** 2
+    if kernel == "trace":
+        A = -mass ** 2 / (2.0 * energy[None, :] * epsp) + mass ** 2 * c / (4.0 * energy[None, :] ** 2)
+    elif kernel == "dot":
+        A = mass ** 2 * omega[:, None] ** 2 / (4.0 * energy[None, :] ** 2 * epsp ** 2)
+    else:
+        raise ValueError("local-energy mode supports only the 'dot' and 'trace' kernels")
+    return A, 0.25 * c, f
+
+
 # --------------------------------------------------------------------------
 # numpy reference path (full square, complex)
 # --------------------------------------------------------------------------
@@ -199,6 +254,38 @@ def _double_sum_numpy(time, position, beta, n, factor, kernel, epsilon, omega,
                      epsilon_prime=eps_p)
         K = N * np.exp(-1j * Phi)
 
+        total += np.einsum("i,ij,j->", w[idx], K, w)
+
+    return total
+
+
+def _double_sum_numpy_local(time, position, beta, n, omega, A, B, f, chunk):
+    """Full-square numpy double sum for the local-energy kernel (one omega).
+
+    ``A, B, f`` are the per-vertex ``(Nt,)`` arrays of
+    :func:`_local_vertex_arrays` for this frequency.  The phase is evaluated
+    in the difference-stable form
+    ``Phi = omega [ fbar (dx) + df (x1 + x2)/2 ]`` with ``x = t - n.r``.
+    """
+    nt = time.shape[0]
+    w = trapz_weights(time)
+    x = time - position @ n          # (Nt,)  light-cone coordinate t - n.r
+    dot = beta @ beta.T              # (Nt, Nt)  b_i . b_j
+
+    total = 0.0 + 0.0j
+    for start in range(0, nt, chunk):
+        idx = np.arange(start, min(start + chunk, nt))
+        Aij = A[idx][:, None] + A[None, :]           # (nchunk, Nt)
+        Bij = B[idx][:, None] + B[None, :]
+        N = Aij + Bij * (dot[idx] - 1.0)
+
+        dx = x[None, :] - x[idx][:, None]
+        xavg = 0.5 * (x[None, :] + x[idx][:, None])
+        fbar = 0.5 * (f[idx][:, None] + f[None, :])
+        df = f[None, :] - f[idx][:, None]
+        Phi = omega * (fbar * dx + df * xavg)
+
+        K = N * np.exp(-1j * Phi)
         total += np.einsum("i,ij,j->", w[idx], K, w)
 
     return total
@@ -281,12 +368,106 @@ if _numba is not None:
         return out
 
 
+if _numba is not None:
+    from numba import njit, prange
+
+    @njit(cache=True)
+    def _accumulate_row_local(i, time, w, beta, nr, nb, omega, A, B, f,
+                              acc, psi, chi):
+        """Add row ``i`` (``j >= i``) of the local-energy double sum.
+
+        Pair kernel ``N_ij = (A[k,i]+A[k,j]) + (B[k,i]+B[k,j]) (b_i.b_j - 1)``
+        and pair phase ``Phi = omega_k [ fbar psi_d + df chi_d ]`` with
+        ``psi_d = dt - (nr[j,d] - nr[i,d])`` (difference form) and
+        ``chi_d = tavg - (nr[j,d] + nr[i,d])/2`` (energy-variation term,
+        vanishes for a constant recoil factor).  Off-diagonal pairs are
+        counted twice (Hermitian symmetry, preserved because ``N`` is
+        symmetric and ``Phi`` antisymmetric under ``i <-> j``).
+        """
+        nt = time.shape[0]
+        nk = omega.shape[0]
+        nd = psi.shape[0]
+        ti = time[i]
+        wi = w[i]
+        bix = beta[i, 0]
+        biy = beta[i, 1]
+        biz = beta[i, 2]
+        for j in range(i, nt):
+            tj = time[j]
+            dt = tj - ti
+            tavg = 0.5 * (tj + ti)
+            wij = wi * w[j]
+            if j > i:
+                wij *= 2.0
+            dot = bix * beta[j, 0] + biy * beta[j, 1] + biz * beta[j, 2]
+            for d in range(nd):
+                psi[d] = dt - (nr[j, d] - nr[i, d])
+                chi[d] = tavg - 0.5 * (nr[j, d] + nr[i, d])
+            x = dot - 1.0
+            for k in range(nk):
+                wN = wij * ((A[k, i] + A[k, j]) + (B[k, i] + B[k, j]) * x)
+                fbar = 0.5 * (f[k, i] + f[k, j])
+                df = f[k, j] - f[k, i]
+                om = omega[k]
+                for d in range(nd):
+                    acc[k, d] += wN * np.cos(om * (fbar * psi[d] + df * chi[d]))
+
+    @njit(parallel=True, cache=True)
+    def _double_sum_batch_local(time, w, beta, nr, nb, omega, A, B, f, block):
+        nt = time.shape[0]
+        nk = omega.shape[0]
+        nd = nr.shape[1]
+        half = (nt + 1) // 2
+        nblocks = (half + block - 1) // block
+        partial = np.zeros((nblocks, nk, nd))
+        for ib in prange(nblocks):
+            acc = np.zeros((nk, nd))
+            psi = np.empty(nd)
+            chi = np.empty(nd)
+            i0 = ib * block
+            i1 = min(i0 + block, half)
+            for ii in range(i0, i1):
+                # rows ii and nt-1-ii together hold nt-1 off-diagonal pairs,
+                # so every iteration carries the same amount of work
+                _accumulate_row_local(ii, time, w, beta, nr, nb, omega, A, B, f,
+                                      acc, psi, chi)
+                jj = nt - 1 - ii
+                if jj != ii:
+                    _accumulate_row_local(jj, time, w, beta, nr, nb, omega, A, B, f,
+                                          acc, psi, chi)
+            partial[ib, :, :] = acc
+        out = np.zeros((nk, nd))
+        for ib in range(nblocks):
+            out += partial[ib]
+        return out
+
+
 # --------------------------------------------------------------------------
 # public integrals
 # --------------------------------------------------------------------------
+def _check_local_energy(energy, nt, kernel, epsilon_prime):
+    """Validate an explicit energy history and return it as a C-ordered array."""
+    energy = np.ascontiguousarray(np.asarray(energy, dtype=np.float64))
+    if kernel == "velocity":
+        raise ValueError(
+            "local-energy mode applies to the 'dot' and 'trace' kernels, "
+            "not to the classical 'velocity' kernel"
+        )
+    if epsilon_prime is not None:
+        raise ValueError(
+            "epsilon_prime must be None in local-energy mode "
+            "(eps'_i = eps(t_i) - omega, or eps(t_i) for the classical phase)"
+        )
+    if energy.ndim != 1 or energy.shape[0] != nt:
+        raise ValueError("energy must have shape (Nt,)")
+    if not np.all(np.isfinite(energy)) or np.any(energy <= 0.0):
+        raise ValueError("energy values must be finite and positive")
+    return energy
+
+
 def double_time_integral_batch(time, position, beta, omega, dirs, epsilon, mass=1.0,
                                kernel="dot", epsilon_prime=None, phase="recoil",
-                               backend="auto", block=None, chunk=256):
+                               backend="auto", block=None, chunk=256, energy=None):
     """``Re int dt1 dt2 N e^{-i Phi}`` for every ``(omega[k], dirs[d])`` pair.
 
     Parameters
@@ -299,7 +480,8 @@ def double_time_integral_batch(time, position, beta, omega, dirs, epsilon, mass=
     epsilon_prime : None, float or (N_omega,) array
         Final-state energy label.  ``None`` -> ``epsilon - omega`` (BK
         recoil, requires ``omega < epsilon``); pass ``epsilon`` for the
-        recoilless / classical comparison.
+        recoilless / classical comparison.  Must be ``None`` in
+        local-energy mode.
     kernel : ``"dot"`` (default), ``"trace"`` or ``"velocity"``.
         ``"dot"`` / ``"trace"`` are the two BK kernels (eq. 7.3 / 7.1);
         ``"velocity"`` is the classical transverse-velocity kernel used for
@@ -313,6 +495,14 @@ def double_time_integral_batch(time, position, beta, omega, dirs, epsilon, mass=
         thread count).
     chunk : int
         numpy only: row-block size of the memory-bounded outer product.
+    energy : (Nt,) array, optional
+        Local electron energy history ``eps(t)`` (sec. 4.2 generalization).
+        When given, the kernel and phase use the per-vertex energies
+        ``eps(t1), eps(t2)`` with ``eps'_i = eps_i - omega`` (recoil phase)
+        or ``eps'_i = eps_i`` (classical phase), and ``epsilon`` /
+        ``epsilon_prime`` are no longer used.  Every value must be positive
+        and, for the recoil phase, above every ``omega[k]``.  On the mass
+        shell ``eps(t) = mass * gamma(t)``.
 
     Returns
     -------
@@ -329,6 +519,31 @@ def double_time_integral_batch(time, position, beta, omega, dirs, epsilon, mass=
     beta = np.ascontiguousarray(beta, dtype=np.float64)
     omega = np.atleast_1d(np.asarray(omega, dtype=np.float64))
     dirs = np.atleast_2d(np.asarray(dirs, dtype=np.float64))
+
+    if energy is not None:
+        energy = _check_local_energy(energy, time.shape[0], kernel, epsilon_prime)
+        A, B, f = _local_vertex_arrays(kernel, omega, energy, phase, mass)
+        if backend == "numpy":
+            out = np.empty((omega.shape[0], dirs.shape[0]))
+            for k in range(omega.shape[0]):
+                for d in range(dirs.shape[0]):
+                    out[k, d] = _double_sum_numpy_local(
+                        time, position, beta, dirs[d], float(omega[k]),
+                        A[k], B[k], f[k], chunk,
+                    ).real
+            return out
+        w = trapz_weights(time)
+        nr = np.ascontiguousarray(position @ dirs.T)   # (Nt, N_dir)  n_d . r_j
+        nb = np.ascontiguousarray(beta @ dirs.T)       # (Nt, N_dir)  n_d . b_j
+        if block is None:
+            half = (time.shape[0] + 1) // 2
+            block = max(1, min(32, half // (4 * _numba.get_num_threads())))
+        return _double_sum_batch_local(
+            time, w, beta, nr, nb, np.ascontiguousarray(omega),
+            np.ascontiguousarray(A), np.ascontiguousarray(B),
+            np.ascontiguousarray(f), int(block),
+        )
+
     eps_p = _final_energy(omega, epsilon, epsilon_prime)
     fac = _phase_factor(phase, omega, epsilon, eps_p)
 
@@ -358,14 +573,15 @@ def double_time_integral_batch(time, position, beta, omega, dirs, epsilon, mass=
 
 def double_time_integral(time, position, beta, omega, n, epsilon, mass=1.0,
                          kernel="dot", epsilon_prime=None, phase="recoil",
-                         chunk=256, backend="auto"):
+                         chunk=256, backend="auto", energy=None):
     """Return ``I = int dt1 dt2 N(t1,t2) exp(-i Phi(t1,t2))`` (complex) for
     one ``(omega, n)``.
 
-    See :func:`double_time_integral_batch` for the parameters.  With the
-    numpy backend the full square is summed and the imaginary part is a
-    round-off diagnostic; with the numba backend the Hermitian symmetry is
-    used explicitly and the imaginary part is exactly zero.
+    See :func:`double_time_integral_batch` for the parameters (``energy`` is
+    the optional local energy history).  With the numpy backend the full
+    square is summed and the imaginary part is a round-off diagnostic; with
+    the numba backend the Hermitian symmetry is used explicitly and the
+    imaginary part is exactly zero.
     """
     if kernel not in _KERNELS:
         raise ValueError("kernel must be 'dot', 'trace' or 'velocity'")
@@ -373,6 +589,22 @@ def double_time_integral(time, position, beta, omega, n, epsilon, mass=1.0,
         raise ValueError("phase must be 'recoil' or 'classical'")
     backend = _resolve_backend(backend)
     omega = float(omega)
+
+    if energy is not None:
+        time_arr = np.asarray(time, dtype=np.float64)
+        energy = _check_local_energy(energy, time_arr.shape[0], kernel, epsilon_prime)
+        A, B, f = _local_vertex_arrays(kernel, np.array([omega]), energy, phase, mass)
+        if backend == "numpy":
+            position = np.asarray(position, dtype=np.float64)
+            beta = np.asarray(beta, dtype=np.float64)
+            n = np.asarray(n, dtype=np.float64)
+            return _double_sum_numpy_local(time_arr, position, beta, n, omega,
+                                           A[0], B[0], f[0], chunk)
+        out = double_time_integral_batch(time, position, beta, [omega], [n], epsilon,
+                                         mass=mass, kernel=kernel, phase=phase,
+                                         backend="numba", energy=energy)
+        return complex(out[0, 0], 0.0)
+
     eps_p = float(np.asarray(_final_energy(omega, epsilon, epsilon_prime)))
     factor = float(np.asarray(_phase_factor(phase, omega, epsilon, eps_p)))
 
@@ -392,17 +624,19 @@ def double_time_integral(time, position, beta, omega, n, epsilon, mass=1.0,
 
 def d2_energy(time, position, beta, omega, n, epsilon, mass=1.0, charge=1.0,
               kernel="dot", epsilon_prime=None, phase="recoil", chunk=256,
-              diagnostics=False, backend="auto"):
+              diagnostics=False, backend="auto", energy=None):
     """Differential energy spectrum ``d2E/(dw dO)`` for one (omega, n).
 
-    With ``diagnostics=True`` returns ``(d2E, d2E_imag)`` where ``d2E_imag``
-    is the imaginary part scaled by the same prefactor (round-off level with
-    the numpy backend, identically zero with numba); the real part is the
-    physical spectrum.
+    ``energy`` optionally switches to the local-energy (sec. 4.2) form, see
+    :func:`double_time_integral_batch`.  With ``diagnostics=True`` returns
+    ``(d2E, d2E_imag)`` where ``d2E_imag`` is the imaginary part scaled by
+    the same prefactor (round-off level with the numpy backend, identically
+    zero with numba); the real part is the physical spectrum.
     """
     I = double_time_integral(time, position, beta, omega, n, epsilon,
                              mass=mass, kernel=kernel, epsilon_prime=epsilon_prime,
-                             phase=phase, chunk=chunk, backend=backend)
+                             phase=phase, chunk=chunk, backend=backend,
+                             energy=energy)
     pref = PREFACTOR * omega ** 2 * charge ** 2
     d2E = pref * I.real
     if diagnostics:
@@ -412,7 +646,7 @@ def d2_energy(time, position, beta, omega, n, epsilon, mass=1.0, charge=1.0,
 
 def d2_probability(time, position, beta, omega, n, epsilon, mass=1.0, charge=1.0,
                    kernel="dot", epsilon_prime=None, phase="recoil", chunk=256,
-                   diagnostics=False, backend="auto"):
+                   diagnostics=False, backend="auto", energy=None):
     """Differential probability ``d2W/(dw dO)`` for one (omega, n).
 
     With ``diagnostics=True`` returns ``(d2W, d2W_imag)`` (see
@@ -422,11 +656,13 @@ def d2_probability(time, position, beta, omega, n, epsilon, mass=1.0, charge=1.0
         d2E, d2E_imag = d2_energy(time, position, beta, omega, n, epsilon,
                                    mass=mass, charge=charge, kernel=kernel,
                                    epsilon_prime=epsilon_prime, phase=phase,
-                                   chunk=chunk, diagnostics=True, backend=backend)
+                                   chunk=chunk, diagnostics=True, backend=backend,
+                                   energy=energy)
         return d2E / omega, d2E_imag / omega
     return d2_energy(time, position, beta, omega, n, epsilon, mass=mass,
                      charge=charge, kernel=kernel, epsilon_prime=epsilon_prime,
-                     phase=phase, chunk=chunk, backend=backend) / omega
+                     phase=phase, chunk=chunk, backend=backend,
+                     energy=energy) / omega
 
 
 def classical_d2_energy(time, position, beta, omega, n, charge=1.0):
@@ -492,7 +728,13 @@ def _recoil_args(params):
 
 
 class BKIntegrator:
-    """Convenience wrapper bundling a trajectory, parameters and a backend."""
+    """Convenience wrapper bundling a trajectory, parameters and a backend.
+
+    When the trajectory carries an ``energy`` history, every spectrum is
+    evaluated with the sec. 4.2 local-energy generalization
+    (``eps(t1), eps(t2)`` with per-vertex recoil); otherwise the fixed
+    incident energy ``Parameters.epsilon`` is used.
+    """
 
     def __init__(self, trajectory: Trajectory, params: Parameters,
                  backend: str = "auto") -> None:
@@ -502,16 +744,20 @@ class BKIntegrator:
         self.time = trajectory.time
         self.position = trajectory.position
         self.beta = trajectory.beta()
+        self.energy = trajectory.energy
 
     # -- grids of (omega, n) ------------------------------------------------
     def d2_energy_batch(self, omega_grid, dirs):
         """``d2E/(dw dO)`` on the full ``(N_omega, N_dir)`` grid."""
         omega_grid = np.atleast_1d(np.asarray(omega_grid, dtype=np.float64))
         phase, eps_p = _recoil_args(self.params)
+        if self.energy is not None:
+            eps_p = None
         I = double_time_integral_batch(
             self.time, self.position, self.beta, omega_grid, dirs,
             self.params.epsilon, mass=self.params.mass, kernel=self.params.kernel,
             epsilon_prime=eps_p, phase=phase, backend=self.backend,
+            energy=self.energy,
         )
         return PREFACTOR * omega_grid[:, None] ** 2 * self.params.charge ** 2 * I
 
@@ -554,6 +800,7 @@ class BKIntegrator:
 
         meta = dict(
             epsilon=self.params.epsilon,
+            local_energy=self.energy is not None,
             mass=self.params.mass,
             charge=self.params.charge,
             recoil=self.params.recoil,

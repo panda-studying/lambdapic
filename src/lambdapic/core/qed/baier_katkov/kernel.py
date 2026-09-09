@@ -16,11 +16,19 @@ Two kernel forms are provided:
 two samples of the same on-shell energy ``eps`` (``gamma = eps/m``), the
 constant pieces combine to ``m^2 (eps - eps')^2 / (2 eps^2 eps'^2)
 = omega^2 / (2 eps'^2 gamma^2)`` and the two forms are *pointwise identical*.
-They differ only once the two times carry different local energies
-``eps1 != eps2`` (the sec. 4.2 generalization), where the trace form with
-``b_i^2 = 1 - m^2/eps_i^2`` is the fundamental one.  In the classical limit
-``omega/eps -> 0`` both reduce to ``b1 . b2 - 1``, which equals the classical
-transverse-velocity kernel ``n x (n x b1) . n x (n x b2)`` up to
+
+For the sec. 4.2 local-energy generalization with per-vertex recoil
+``eps'_i = eps_i - omega`` (the ``epsilon2`` keyword arguments) the same
+identity survives vertex by vertex: each vertex contributes
+``m^2 (eps_i - eps'_i)^2 / (4 eps_i^2 eps'_i^2) = m^2 omega^2/(4 eps_i^2 eps'_i^2)``
+to the constant piece, so the symmetrized local dot and trace forms still
+coincide exactly (verified to round-off by the regression tests).  They
+differ only when ``eps'`` is *not* tied to the local energy per vertex --
+e.g. in the classical ``eps'_i = eps_i`` mode, or if a single fixed
+``eps'`` were kept while ``eps_i`` varies; in that convention the trace form
+with ``b_i^2 = 1 - m^2/eps_i^2`` is the fundamental one.  In the classical
+limit ``omega/eps -> 0`` both reduce to ``b1 . b2 - 1``, which equals the
+classical transverse-velocity kernel ``n x (n x b1) . n x (n x b2)`` up to
 total-derivative (boundary) terms.
 
 Validation history: an earlier transcription of the trace form carried the
@@ -57,36 +65,90 @@ def _eps_prime(epsilon, omega, epsilon_prime=None):
     return epsilon - omega
 
 
-def trace_kernel(beta1, beta2, epsilon, omega, mass=1.0, epsilon_prime=None):
+def trace_kernel(beta1, beta2, epsilon, omega, mass=1.0, epsilon_prime=None,
+                 epsilon2=None, epsilon_prime2=None):
     """Trace kernel ``N12`` of eq. 7.1 (spin-averaged, pol.-summed).
 
     ``N12 = -m^2/(eps eps') - (eps^2 + eps'^2)/(4 eps'^2) (b1 - b2)^2``.
     ``epsilon_prime`` defaults to ``epsilon - omega``; pass
     ``epsilon_prime=epsilon`` for the recoilless (classical) limit.  On shell
     (``|b_i|^2 = 1 - m^2/eps^2``) this is identical to :func:`dot_kernel`.
+
+    **Local-energy form (sec. 4.2).**  With ``epsilon2`` (and optionally
+    ``epsilon_prime2``) the two vertices carry independent local energies
+    ``eps1, eps2`` and the kernel generalizes to the symmetric form
+
+    ``N12 = (A1 + A2) + (B1 + B2) (b1 . b2 - 1)``
+
+    with per-vertex coefficients
+
+    ``A_i = -m^2/(2 eps_i eps'_i) + m^2 c_i/(4 eps_i^2)``,
+    ``B_i = c_i / 4``, ``c_i = (eps_i^2 + eps'_i^2)/eps'_i^2``,
+
+    and ``b_i^2 = 1 - m^2/eps_i^2`` on shell.  It reduces to the
+    fixed-energy form above when ``eps1 == eps2``, and to the classical
+    ``b1 . b2 - 1`` as ``omega/eps -> 0``.  With per-vertex recoil
+    ``eps'_i = eps_i - omega`` it coincides with the local :func:`dot_kernel`
+    (the on-shell identity holds vertex by vertex, since
+    ``(eps_i - eps'_i)^2 = omega^2``); in the classical ``eps'_i = eps_i``
+    mode the trace form gives the pure ``b1 . b2 - 1`` kernel and is the
+    one that stays free of ``omega``-contact terms.
     """
-    eps_p = _eps_prime(epsilon, omega, epsilon_prime)
-    db2 = np.sum((np.asarray(beta1) - np.asarray(beta2)) ** 2, axis=-1)
-    return -(mass ** 2 / (epsilon * eps_p)) - (
-        (epsilon ** 2 + eps_p ** 2) / (4.0 * eps_p ** 2)
-    ) * db2
+    eps1 = np.asarray(epsilon, dtype=np.float64)
+    epsp1 = _eps_prime(eps1, omega, epsilon_prime)
+    if epsilon2 is None and epsilon_prime2 is None:
+        db2 = np.sum((np.asarray(beta1) - np.asarray(beta2)) ** 2, axis=-1)
+        return -(mass ** 2 / (eps1 * epsp1)) - (
+            (eps1 ** 2 + epsp1 ** 2) / (4.0 * epsp1 ** 2)
+        ) * db2
+    eps2 = np.asarray(eps1 if epsilon2 is None else epsilon2, dtype=np.float64)
+    epsp2 = _eps_prime(eps2, omega, epsilon_prime2)
+    dot = np.sum(np.asarray(beta1) * np.asarray(beta2), axis=-1)
+    c1 = (eps1 ** 2 + epsp1 ** 2) / epsp1 ** 2
+    c2 = (eps2 ** 2 + epsp2 ** 2) / epsp2 ** 2
+    A1 = -mass ** 2 / (2.0 * eps1 * epsp1) + mass ** 2 * c1 / (4.0 * eps1 ** 2)
+    A2 = -mass ** 2 / (2.0 * eps2 * epsp2) + mass ** 2 * c2 / (4.0 * eps2 ** 2)
+    return (A1 + A2) + 0.25 * (c1 + c2) * (dot - 1.0)
 
 
-def dot_kernel(beta1, beta2, epsilon, omega, mass=1.0, epsilon_prime=None):
+def dot_kernel(beta1, beta2, epsilon, omega, mass=1.0, epsilon_prime=None,
+               epsilon2=None, epsilon_prime2=None):
     """Velocity / dot-product kernel ``Ndot`` of eq. 7.3.
 
     ``gamma`` is taken as ``epsilon / mass`` (local-energy approximation,
     ``m = 1`` in natural units).  ``epsilon_prime`` defaults to
     ``epsilon - omega``; pass ``epsilon_prime=epsilon`` for the classical limit.
+
+    **Local-energy form (sec. 4.2).**  With ``epsilon2`` (and optionally
+    ``epsilon_prime2``) the symmetrized generalization is
+
+    ``N12 = (A1 + A2) + (B1 + B2) (b1 . b2 - 1)``
+
+    with ``A_i = m^2 omega^2/(4 eps_i^2 eps'_i^2)`` and ``B_i = c_i / 4``
+    (``c_i`` as in :func:`trace_kernel`).  It reduces to the fixed-energy
+    form when ``eps1 == eps2``.  With per-vertex recoil
+    ``eps'_i = eps_i - omega`` it coincides exactly with the local
+    :func:`trace_kernel`; in the classical ``eps'_i = eps_i`` mode it keeps
+    the ``m^2 omega^2`` contact term that the trace form drops there.
     """
-    eps_p = _eps_prime(epsilon, omega, epsilon_prime)
-    gamma = epsilon / mass
-    b1 = np.asarray(beta1)
-    b2 = np.asarray(beta2)
-    dot = np.sum(b1 * b2, axis=-1)
-    return (
-        (epsilon ** 2 + eps_p ** 2) * (dot - 1.0) + omega ** 2 / gamma ** 2
-    ) / (2.0 * eps_p ** 2)
+    eps1 = np.asarray(epsilon, dtype=np.float64)
+    epsp1 = _eps_prime(eps1, omega, epsilon_prime)
+    if epsilon2 is None and epsilon_prime2 is None:
+        gamma = eps1 / mass
+        b1 = np.asarray(beta1)
+        b2 = np.asarray(beta2)
+        dot = np.sum(b1 * b2, axis=-1)
+        return (
+            (eps1 ** 2 + epsp1 ** 2) * (dot - 1.0) + omega ** 2 / gamma ** 2
+        ) / (2.0 * epsp1 ** 2)
+    eps2 = np.asarray(eps1 if epsilon2 is None else epsilon2, dtype=np.float64)
+    epsp2 = _eps_prime(eps2, omega, epsilon_prime2)
+    dot = np.sum(np.asarray(beta1) * np.asarray(beta2), axis=-1)
+    c1 = (eps1 ** 2 + epsp1 ** 2) / epsp1 ** 2
+    c2 = (eps2 ** 2 + epsp2 ** 2) / epsp2 ** 2
+    A1 = mass ** 2 * omega ** 2 / (4.0 * eps1 ** 2 * epsp1 ** 2)
+    A2 = mass ** 2 * omega ** 2 / (4.0 * eps2 ** 2 * epsp2 ** 2)
+    return (A1 + A2) + 0.25 * (c1 + c2) * (dot - 1.0)
 
 
 def classical_velocity_kernel(beta1, beta2, n):

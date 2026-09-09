@@ -37,7 +37,7 @@ __all__ = [
 ]
 
 
-def as_trajectory(time, position, momentum=None, mass=1.0, charge=1.0) -> Trajectory:
+def as_trajectory(time, position, momentum=None, energy=None, mass=1.0, charge=1.0) -> Trajectory:
     """Construct a :class:`Trajectory` from raw arrays, checking the ordering."""
     time = np.asarray(time, dtype=np.float64)
     if time.ndim != 1:
@@ -45,7 +45,7 @@ def as_trajectory(time, position, momentum=None, mass=1.0, charge=1.0) -> Trajec
     if np.any(np.diff(time) <= 0):
         raise ValueError("time samples must be strictly increasing")
     return Trajectory(time=time, position=position, momentum=momentum,
-                      mass=mass, charge=charge)
+                      energy=energy, mass=mass, charge=charge)
 
 
 def uniform_trajectory(r_of_t, t0, t1, n_samples, **kwargs) -> Trajectory:

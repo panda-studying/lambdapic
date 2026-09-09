@@ -40,6 +40,26 @@ def circle(gamma, rho, n_samples, turns=1.0):
     return Trajectory(time=t, position=r, momentum=u), Omega
 
 
+def energy_varying_circle(gamma0, n_samples, delta, turns=1.0):
+    """Exactly-closed planar loop with ``gamma(t) = gamma0 (1 + delta sin 2 pi t)``.
+
+    ``rho`` is chosen from ``2 pi rho = int |beta| dt`` so the loop closes on
+    itself (no finite-record boundary term), while ``gamma`` sweeps over an
+    ``O(1)`` range -- the regime where the fixed incident energy of P-2 is
+    wrong.  The momentum ``u = gamma beta`` is built on shell, so the local
+    energy ``eps = mass * gamma`` is exactly consistent with ``beta``.
+    """
+    T0 = 1.0
+    t = np.linspace(0.0, turns * T0, n_samples)
+    gam = gamma0 * (1.0 + delta * np.sin(2.0 * np.pi * t / T0))
+    beta_mag = np.sqrt(1.0 - 1.0 / gam ** 2)
+    rho = float(np.trapezoid(beta_mag, t) / (2.0 * np.pi * turns))
+    phi = np.concatenate([[0.0], np.cumsum(0.5 * (beta_mag[:-1] + beta_mag[1:]) * np.diff(t))]) / rho
+    r = np.column_stack([rho * np.cos(phi), rho * np.sin(phi), np.zeros_like(t)])
+    u = (gam * beta_mag)[:, None] * np.column_stack([-np.sin(phi), np.cos(phi), np.zeros_like(t)])
+    return Trajectory(time=t, position=r, momentum=u, energy=gam), rho
+
+
 @pytest.fixture(scope="module")
 def small_circle():
     traj, Omega = circle(gamma=10.0, rho=200.0, n_samples=200)
@@ -268,3 +288,142 @@ def test_invalid_input_rejected(small_circle):
         Parameters(epsilon=10.0, spin_averaged=False)
     with pytest.raises(ValueError):
         bki.double_time_integral(*args, 1.0, dirs[0], 10.0, backend="foo")
+
+
+# --------------------------------------------------------------------------
+# P-2: local-energy (sec. 4.2) generalization -- eps(t1), eps(t2)
+# --------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def varying_circle():
+    """Exactly-closed, on-shell trajectory with gamma(t) sweeping 7 -> 13."""
+    traj, rho = energy_varying_circle(gamma0=10.0, n_samples=256, delta=0.3)
+    beta0 = np.sqrt(1.0 - 1.0 / 10.0 ** 2)
+    Omega = beta0 / rho
+    dirs = np.array([[0.0, 0.0, 1.0],
+                     [0.0, 0.5, np.sqrt(0.75)],
+                     [np.sin(1.2), 0.0, np.cos(1.2)]])
+    omegas = np.array([0.5 * Omega, 3.0 * Omega, 2.0, 6.0])
+    omegas = omegas[omegas < 0.9 * traj.energy.min()]
+    return traj, Omega, dirs, omegas
+
+
+@pytest.mark.parametrize("kernel", ["dot", "trace"])
+@pytest.mark.parametrize("backend", ["numpy", "numba"])
+def test_local_energy_degenerates_to_fixed(small_circle, kernel, backend):
+    """A constant energy history reproduces the fixed-epsilon path exactly."""
+    if backend == "numba" and not HAS_NUMBA:
+        pytest.skip("numba backend not available")
+    traj, _, dirs, omegas = small_circle
+    beta = traj.beta()
+    fixed = bki.double_time_integral_batch(
+        traj.time, traj.position, beta, omegas, dirs, 10.0,
+        kernel=kernel, backend=backend,
+    )
+    local = bki.double_time_integral_batch(
+        traj.time, traj.position, beta, omegas, dirs, 10.0,
+        kernel=kernel, backend=backend, energy=np.full(traj.n_samples, 10.0),
+    )
+    assert np.max(np.abs(local - fixed)) < 1e-10 * np.max(np.abs(fixed))
+
+
+@pytest.mark.parametrize("backend", ["numpy", "numba"])
+def test_local_energy_kernels_coincide_on_shell(varying_circle, backend):
+    """With per-vertex recoil eps'_i = eps_i - omega the on-shell identity
+    survives vertex by vertex, so the local dot and trace kernels coincide."""
+    if backend == "numba" and not HAS_NUMBA:
+        pytest.skip("numba backend not available")
+    traj, _, dirs, omegas = varying_circle
+    beta = traj.beta()
+    dot = bki.double_time_integral_batch(
+        traj.time, traj.position, beta, omegas, dirs, 10.0,
+        kernel="dot", backend=backend, energy=traj.energy,
+    )
+    trace = bki.double_time_integral_batch(
+        traj.time, traj.position, beta, omegas, dirs, 10.0,
+        kernel="trace", backend=backend, energy=traj.energy,
+    )
+    assert np.max(np.abs(trace - dot)) < 1e-10 * np.max(np.abs(dot))
+
+
+@pytest.mark.skipif(not HAS_NUMBA, reason="numba backend not available")
+@pytest.mark.parametrize("kernel", ["dot", "trace"])
+def test_local_energy_matches_numpy(varying_circle, kernel):
+    traj, _, dirs, omegas = varying_circle
+    beta = traj.beta()
+    args = (traj.time, traj.position, beta, omegas, dirs, 10.0)
+    ref = bki.double_time_integral_batch(*args, kernel=kernel, backend="numpy",
+                                         energy=traj.energy)
+    fast = bki.double_time_integral_batch(*args, kernel=kernel, backend="numba",
+                                          energy=traj.energy)
+    assert np.max(np.abs(fast - ref)) < 1e-11 * np.max(np.abs(ref))
+
+
+def test_local_energy_is_hermitian(varying_circle):
+    """Full-square imaginary part is round-off: Phi antisymmetric, N symmetric."""
+    traj, _, dirs, omegas = varying_circle
+    I = bki.double_time_integral(traj.time, traj.position, traj.beta(), omegas[1],
+                                 dirs[1], 10.0, kernel="trace", backend="numpy",
+                                 energy=traj.energy)
+    assert abs(I.imag) < 1e-10 * abs(I.real)
+
+
+def test_local_energy_spectrum_positive(varying_circle):
+    """dW/dw stays positive at boundary-free harmonics of a closed varying-energy orbit."""
+    traj, Omega, _, _ = varying_circle
+    grid = np.array([bkr.recoil_shifted_harmonic(m, Omega, float(traj.energy.min()))
+                     for m in range(1, 9)])
+    grid = grid[grid < 0.99 * traj.energy.min()]
+    spec = bki.compute_spectrum(traj, Parameters(epsilon=float(traj.energy[0])),
+                                grid, theta_max=np.pi, n_theta=16, n_phi=8)
+    assert np.all(spec.dW_domega > 0.0)
+    assert spec.total_probability() > 0.0
+    assert spec.metadata["local_energy"] is True
+
+
+def test_local_energy_classical_is_energy_independent(varying_circle):
+    """Classical mode (eps'_i = eps_i, f = 1) is blind to the energy history:
+    the local trace kernel is exactly b1.b2 - 1 and the recoil factor 1, so a
+    varying and a constant energy history give identical results."""
+    traj, _, dirs, omegas = varying_circle
+    beta = traj.beta()
+    n = dirs[1]
+    for omega in omegas:
+        varying = bki.double_time_integral(traj.time, traj.position, beta, omega, n,
+                                           10.0, kernel="trace", phase="classical",
+                                           backend="numpy", energy=traj.energy).real
+        const = bki.double_time_integral(traj.time, traj.position, beta, omega, n,
+                                         10.0, kernel="trace", phase="classical",
+                                         backend="numpy",
+                                         energy=np.full(traj.n_samples, 10.0)).real
+        assert np.isclose(varying, const, rtol=1e-12, atol=0.0)
+
+
+def test_local_energy_validation(varying_circle):
+    traj, _, dirs, _ = varying_circle
+    args = (traj.time, traj.position, traj.beta())
+    good = traj.energy
+    with pytest.raises(ValueError):
+        # wrong length
+        bki.double_time_integral_batch(traj.time, traj.position, traj.beta(),
+                                       [1.0], dirs, 10.0, energy=good[:-1])
+    with pytest.raises(ValueError):
+        # non-positive energy
+        bad = good.copy(); bad[3] = -1.0
+        bki.double_time_integral_batch(traj.time, traj.position, traj.beta(),
+                                       [1.0], dirs, 10.0, energy=bad)
+    with pytest.raises(ValueError):
+        # omega above a local energy (eps'_i = eps_i - omega <= 0)
+        bki.double_time_integral_batch(traj.time, traj.position, traj.beta(),
+                                       [traj.energy.min() + 1.0], dirs, 10.0,
+                                       energy=good)
+    with pytest.raises(ValueError):
+        # epsilon_prime is ambiguous in local mode
+        bki.double_time_integral(*args, 1.0, dirs[0], 10.0, energy=good,
+                                 epsilon_prime=9.0)
+    with pytest.raises(ValueError):
+        # velocity kernel has no energy dependence
+        bki.double_time_integral(*args, 1.0, dirs[0], 10.0, kernel="velocity",
+                                 phase="classical", energy=good)
+    with pytest.raises(ValueError):
+        Trajectory(time=traj.time, position=traj.position, momentum=traj.momentum,
+                   energy=np.full((traj.n_samples, 1), 10.0))
