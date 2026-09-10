@@ -112,10 +112,10 @@ $$N_{ij} = (A_i + A_j) + (B_i + B_j)\,(\mathbf b_i\cdot\mathbf b_j - 1)$$
 
 | | $A_i$ | $B_i$ |
 |---|---|---|
-| trace | $-\dfrac{m^2}{2\varepsilon_i\varepsilon'_i} + \dfrac{m^2 c_i}{4\varepsilon_i^2}$ | $c_i/4$ |
-| dot | $\dfrac{m^2\omega^2}{4\varepsilon_i^2\varepsilon'_i^2}$ | $c_i/4$ |
+| trace | $-\frac{m^2}{2\varepsilon_i\varepsilon'_i} + \frac{m^2 c_i}{4\varepsilon_i^2}$ | $c_i/4$ |
+| dot | $\frac{m^2\omega^2}{4\varepsilon_i^2{\varepsilon'_i}^2}$ | $c_i/4$ |
 
-其中 $c_i = (\varepsilon_i^2 + \varepsilon'_i^2)/\varepsilon'_i^2$。固定能量时（$\varepsilon_1 = \varepsilon_2$）上式精确退化回 [§2.3](#23-核-dottracevelocity) 的形式。
+其中 $c_i = (\varepsilon_i^2 + {\varepsilon'_i}^2)/{\varepsilon'_i}^2$。固定能量时（$\varepsilon_1 = \varepsilon_2$）上式精确退化回 [§2.3](#23-核-dottracevelocity) 的形式。
 
 **关键发现**：逐顶点反冲约定下，每个顶点独立满足在壳恒等式 $(\varepsilon_i - \varepsilon'_i)^2 = \omega^2$，因此局域 dot 与局域 trace **仍然逐顶点重合**（回归测试验证到 $10^{-10}$ 相对误差）。旧的"$\varepsilon_1\ne\varepsilon_2$ 时两核不同"的预期只在"全局固定 $\varepsilon'$ 而 $\varepsilon_i$ 变化"的约定下成立；本模块采用逐顶点约定，两核合一。唯一例外是**经典模式**（$\varepsilon'_i = \varepsilon_i$，$f_i = 1$）：此时 trace 形式给出纯 $\mathbf b_i\cdot\mathbf b_j - 1$（无 $\omega$ 接触项），是基本形式；dot 形式保留 $m^2\omega^2$ 接触项。经典模式下谱与能量历史无关（$A_i = 0$、$B_i = 1/2$、$f = 1$ 不依赖 $\varepsilon$），回归测试验证了这一点。
 
