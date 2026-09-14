@@ -446,7 +446,16 @@ $$\frac{dW}{dt\,d\delta} = -\frac{\alpha}{\varepsilon}\Big[\int_z^{\infty}\!\mat
 
 ### 6.10 `validation_plot.py` — 验证汇总图
 
-`main(save_path=None)`：重跑 V1–V8 并渲染成一张 9 面板的 `validation_summary.png`（V3 比值、V4 谐波比值+Larmor 闭合、V5 对数条形、V6 正性谱、V1/V2/V7 相对误差、V8 谱+比值、判定汇总面板）。仅此文件需要 matplotlib（Agg 后端，中文字体 Microsoft YaHei/SimHei）。⚠️ 该 PNG 是二值产物，不要用文本工具打开。
+`main(save_path=None)`：重跑 V1–V8 并渲染成一张 9 面板的 `validation_summary.png`（V3 比值、V4 谐波比值+Larmor 闭合、V5 对数条形、V6 正性谱、V1/V2/V7 相对误差、V8 谱+比值、判定汇总面板）。仅 `validation_plot` / `coherence_plot` 需要 matplotlib（Agg 后端）。⚠️ 该 PNG 是二值产物，不要用文本工具打开。
+
+**绘图约定（两个绘图模块共用，2026-09-14 起）**：
+
+- **期刊风样式**由 `set_publication_style()` 统一设置：白色背景、无网格、四边方框轴、刻度朝内、字号 12、`savefig.dpi=300`；面板标题不加粗（衬线中文字体没有粗体成员，加粗会让 matplotlib 换用别的字体，标题中文就和正文不一致了）。
+- **公式一律写成 LaTeX mathtext**（`r"$\omega/\varepsilon$"`、`r"$d^2E/d\omega\,d\Omega$"`、`r"$\Gamma = n$"`），字体集 `mathtext.fontset="stix"`——STIX 与正文的 Times 是配套设计，比 Computer Modern 更贴。本机没有 TeX 安装，故用 mathtext 而非 `text.usetex`。
+- **同一行不能同时出现 mathtext 与汉字**——硬约束，不是风格。matplotlib 把含美元定界符的整行交给 mathtext 解析，非数学段用的是**数学字体**，而它没有 CJK 覆盖，于是该行每个汉字都变成豆腐块。本机实测（matplotlib 3.10.8）：`"$\Gamma$ = 线中心密度"` 缺字 5 个；把汉字挪到独立行后缺字 **0**。混合标签一律用 `_stack()` 拆行：公式一行、汉字一行。
+- **字体栈必须写在 `font.family` 本身，不能走 `font.serif`**。标准写法 `font.family="serif"` 配 `font.serif=[..., "AR PL UMing CN"]` **不会**逐字形回退——实测缺字 28 个，而把同一串字体直接给 `font.family` 则缺字 0。故 `font.family` 是那个具体字体列表，顺序为 Times New Roman → DejaVu Serif → 衬线中文（AR PL UMing CN / AR PL SungtiL GB，让汉字与 Times 配）→ DejaVu Sans（末尾的**符号回退**：判定面板的 ✓/✗（U+2713/U+2717）在衬线字体和中文字体里都没有，只有它覆盖）。
+- `_check_labels(fig)` 在 `savefig` 前扫描全部 Text 对象，发现"一行里既有美元定界符又有汉字"直接抛 `ValueError`——把静默豆腐块变成响亮报错，防止以后改标签时退回旧写法。
+- 因标签可能变两行、字号放大后行高变化，改动标签或字号后**要重新看图**——这几条都是踩出来的：两行刻度标签把 V5 的注记挤掉（已移到左上）；V6 与 V1/V2/V7 的注记压在柱子上（V6 加了 y 轴留白，V1/V2/V7 移到顶部）；`coherence_summary.png` 的顶栏只放得下单行 suptitle，12 pt 下需要把 gridspec 顶部降到 0.885。
 
 ### 6.12 `coherence.py` / `coherence_plot.py` — Test B（圈间相干）
 
