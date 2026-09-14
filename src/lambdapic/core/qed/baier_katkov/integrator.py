@@ -104,6 +104,7 @@ __all__ = [
     "d2_energy",
     "classical_d2_energy",
     "cone_directions",
+    "cone_bands",
     "sampling_margin",
     "formation_time",
     "record_adequacy",
@@ -630,6 +631,19 @@ def double_time_integral_batch(time, position, beta, omega, dirs, epsilon, mass=
     )
 
 
+def _as_scalar_omega(omega) -> float:
+    """Coerce a single photon energy to ``float``.
+
+    Accepts a python scalar, a 0-d array or a size-1 array -- the single-point
+    entries are routinely called as ``grid[i:i + 1]``, and ``float(np.array([w]))``
+    raises ``TypeError`` on NumPy >= 2.
+    """
+    arr = np.atleast_1d(np.asarray(omega, dtype=np.float64))
+    if arr.size != 1:
+        raise ValueError(f"expected a single omega, got array of size {arr.size}")
+    return float(arr[0])
+
+
 def double_time_integral(time, position, beta, omega, n, epsilon, mass=1.0,
                          kernel="dot", epsilon_prime=None, phase="recoil",
                          chunk=256, backend="auto", energy=None, checks="warn"):
@@ -647,7 +661,7 @@ def double_time_integral(time, position, beta, omega, n, epsilon, mass=1.0,
     if phase not in _PHASES:
         raise ValueError("phase must be 'recoil' or 'classical'")
     backend = _resolve_backend(backend)
-    omega = float(omega)
+    omega = _as_scalar_omega(omega)
 
     if energy is not None:
         time_arr = np.asarray(time, dtype=np.float64)
@@ -705,7 +719,7 @@ def d2_energy(time, position, beta, omega, n, epsilon, mass=1.0, charge=1.0,
                              mass=mass, kernel=kernel, epsilon_prime=epsilon_prime,
                              phase=phase, chunk=chunk, backend=backend,
                              energy=energy, checks=checks)
-    pref = PREFACTOR * omega ** 2 * charge ** 2
+    pref = PREFACTOR * _as_scalar_omega(omega) ** 2 * charge ** 2
     d2E = pref * I.real
     if diagnostics:
         return d2E, pref * I.imag
@@ -718,8 +732,16 @@ def d2_probability(time, position, beta, omega, n, epsilon, mass=1.0, charge=1.0
     """Differential probability ``d2W/(dw dO)`` for one (omega, n).
 
     With ``diagnostics=True`` returns ``(d2W, d2W_imag)`` (see
-    :func:`d2_energy`).
+    :func:`d2_energy`).  ``dE/domega`` carries ``omega^2``, so the quotient
+    ``dW/domega = dE/domega / omega`` is ``0/0`` at ``omega = 0``; zero (and
+    negative) photon energies are rejected here rather than returning a NaN.
     """
+    omega = _as_scalar_omega(omega)
+    if omega <= 0.0:
+        raise ValueError(
+            "omega must be strictly positive: dW/domega = dE/domega / omega is "
+            f"undefined at omega = 0 (got {omega!r}); use d2_energy for omega = 0"
+        )
     if diagnostics:
         d2E, d2E_imag = d2_energy(time, position, beta, omega, n, epsilon,
                                    mass=mass, charge=charge, kernel=kernel,
@@ -743,6 +765,35 @@ def classical_d2_energy(time, position, beta, omega, n, charge=1.0):
     return PREFACTOR * omega ** 2 * charge ** 2 * np.sum(np.abs(A) ** 2)
 
 
+def cone_bands(theta_max, n_theta, split=None, n_inner=None):
+    """The ``(bound, n_nodes)`` panels :func:`cone_directions` will actually use.
+
+    Single source of truth for the two-panel rule.  Exposing the effective
+    panels is what lets callers report the grid they *got* rather than the one
+    they *asked for* (the metadata used to record an ignored ``split``).
+
+    ``split`` and ``n_inner`` must be supplied together; a ``split`` outside
+    ``(0, theta_max)`` raises rather than silently falling back to a single
+    panel.  Returns a one-element list ``[(theta_max, n_theta)]``, or two
+    elements ``[(split, n_inner), (theta_max, n_theta)]`` (inner panel first).
+    """
+    theta_max = float(theta_max)
+    if split is None and n_inner is None:
+        return [(theta_max, int(n_theta))]
+    if split is None or n_inner is None:
+        raise ValueError(
+            "split and n_inner must be given together: the two-panel rule needs "
+            "both the split angle and the number of inner nodes"
+        )
+    split = float(split)
+    if not 0.0 < split < theta_max:
+        raise ValueError(
+            f"split must satisfy 0 < split < theta_max, got split={split!r} "
+            f"with theta_max={theta_max!r}"
+        )
+    return [(split, int(n_inner)), (theta_max, int(n_theta))]
+
+
 def cone_directions(axis, theta_max, n_theta, n_phi, split=None, n_inner=None):
     """Directions and solid-angle weights on a cone around ``axis``.
 
@@ -762,15 +813,15 @@ def cone_directions(axis, theta_max, n_theta, n_phi, split=None, n_inner=None):
     needs ``n_theta ~ 64`` to converge; splitting the ``1/gamma`` core off with
     ``split = 8/gamma`` and ``n_inner ~ 24`` reproduces the converged value to
     the printed digits.  Directions are ordered inner panel first, then outer,
-    each grouped by ``theta`` with the ``n_phi`` azimuths innermost.
+    each grouped by ``theta`` with the ``n_phi`` azimuths innermost.  **Within
+    each panel ``theta`` runs descending** (the Gauss--Legendre nodes are stored
+    ascending in ``cos(theta)``), so the node nearest ``theta_max`` is the
+    *first* ``n_phi`` entries of the *last* panel -- see
+    :func:`angular_edge_fraction`, which relies on this.
     """
+    bands = cone_bands(theta_max, n_theta, split, n_inner)
     axis = np.asarray(axis, dtype=np.float64)
     axis = axis / np.linalg.norm(axis)
-
-    if split is None or n_inner is None or not 0.0 < split < theta_max:
-        bands = [(theta_max, n_theta)]
-    else:
-        bands = [(split, n_inner), (theta_max, n_theta)]
 
     cos_theta = []
     dcos = []
@@ -950,18 +1001,29 @@ def default_theta_max(time, beta, omega, epsilon, epsilon_prime=None,
     return min(np.pi, value)
 
 
-def angular_edge_fraction(d2E, dom, n_phi):
+def angular_edge_fraction(d2E, dom, n_phi, offset=0):
     """Fraction of the angular integral carried by the outermost ``theta`` node.
 
-    Free diagnostic (no recompute).  With :func:`cone_directions` ordering the
-    directions inner panel first, then outer, the last ``n_phi`` samples are the
-    node nearest ``theta_max``.  A large value means the spectrum is fed by
-    emission at the edge of the cone -- i.e. the cone is close to truncating and
-    ``theta_max`` should be raised.
+    Free diagnostic (no recompute).  :func:`cone_directions` stores each panel
+    with ``theta`` **descending** (the Gauss--Legendre nodes come out ascending
+    in ``cos(theta)``), so the node nearest ``theta_max`` is the *first*
+    ``n_phi`` entries of the **last** panel -- not the last entries.  ``offset``
+    is the index of that first entry: ``0`` for a single panel,
+    ``n_inner * n_phi`` for a two-panel grid.  Build it from :func:`cone_bands`::
+
+        bands = cone_bands(theta_max, n_theta, split, n_inner)
+        offset = bands[0][1] * n_phi if len(bands) == 2 else 0
+
+    (An earlier version read ``d2E[:, -n_phi:]``, i.e. the node nearest the
+    *axis*, which reported a small value exactly when the cone was truncating.)
+
+    A large value means the spectrum is fed by emission at the edge of the cone
+    -- i.e. the cone is close to truncating and ``theta_max`` should be raised.
     """
     d2E = np.atleast_2d(np.asarray(d2E, dtype=np.float64))
     dom = np.asarray(dom, dtype=np.float64)
-    edge = np.sum(d2E[:, -n_phi:] * dom[-n_phi:], axis=1)
+    band = slice(int(offset), int(offset) + int(n_phi))
+    edge = np.sum(d2E[:, band] * dom[band], axis=1)
     total = d2E @ dom
     with np.errstate(divide="ignore", invalid="ignore"):
         return np.where(total != 0.0, edge / total, 0.0)
@@ -1014,8 +1076,10 @@ def formation_time(time, beta, omega, epsilon, epsilon_prime=None):
     ``tau_f = (6 eps' / (omega Omega_eff^2))**(1/3)`` -- the time for the
     curvature term of the accumulated phase, ``(omega/2eps') Omega_eff^2
     tau^3/3``, to reach unity (``Omega_eff`` = median ``|dv/dt|``, equal to
-    ``chi/gamma^2`` on a circle).  Returns ``inf`` for a straight record,
-    where the diagnostic does not apply.
+    ``chi/gamma^2`` on a circle).  Returns ``inf`` for a straight record or for
+    ``omega <= 0`` (where ``tau_f -> inf``), cases in which the diagnostic does
+    not apply -- :func:`record_adequacy` maps ``inf`` to "not applicable" rather
+    than to "maximally inadequate".
 
     This is the coherence scale of the double-time integral: pairs with
     ``|t2 - t1| >> tau_f`` oscillate and cancel, so the spectrum is carried by
@@ -1029,7 +1093,9 @@ def formation_time(time, beta, omega, epsilon, epsilon_prime=None):
     rate = _curvature_rate(time, beta)
     if rate <= 0.0:
         return np.full(omega.shape, np.inf)
-    return (6.0 * eps_p / (omega * rate ** 2)) ** (1.0 / 3.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        tau_f = (6.0 * eps_p / (omega * rate ** 2)) ** (1.0 / 3.0)
+    return np.where(omega > 0.0, tau_f, np.inf)
 
 
 def record_adequacy(time, beta, omega, epsilon, epsilon_prime=None):
@@ -1180,13 +1246,26 @@ class BKIntegrator:
     def d2_probability_batch(self, omega_grid, dirs):
         """``d2W/(dw dO)`` on the full ``(N_omega, N_dir)`` grid."""
         omega_grid = np.atleast_1d(np.asarray(omega_grid, dtype=np.float64))
+        if not np.all(np.isfinite(omega_grid)) or np.any(omega_grid <= 0.0):
+            raise ValueError(
+                "omega_grid must be finite and strictly positive: dW/domega = "
+                "dE/domega / omega is undefined at omega = 0 (dE/domega carries "
+                "omega^2, so the quotient is 0/0 there)"
+            )
         return self.d2_energy_batch(omega_grid, dirs) / omega_grid[:, None]
 
     # -- single (omega, n) -------------------------------------------------
     def d2_energy(self, omega, n):
-        return float(self.d2_energy_batch([omega], [n])[0, 0])
+        return float(self.d2_energy_batch([_as_scalar_omega(omega)], [n])[0, 0])
 
     def d2_probability(self, omega, n):
+        omega = _as_scalar_omega(omega)
+        if omega <= 0.0:
+            raise ValueError(
+                "omega must be strictly positive: dW/domega = dE/domega / omega "
+                f"is undefined at omega = 0 (got {omega!r}); use d2_energy for "
+                "omega = 0"
+            )
         return self.d2_energy(omega, n) / omega
 
     # -- adequacy diagnostics ----------------------------------------------
@@ -1285,6 +1364,12 @@ class BKIntegrator:
         ``checks="warn"`` (the default), with ``"raise"``/``"ignore"`` available.
         """
         omega_grid = np.atleast_1d(np.asarray(omega_grid, dtype=np.float64))
+        if not np.all(np.isfinite(omega_grid)) or np.any(omega_grid <= 0.0):
+            raise ValueError(
+                "omega_grid must be finite and strictly positive: dW/domega = "
+                "dE/domega / omega is undefined at omega = 0 (dE/domega carries "
+                "omega^2, so the quotient is 0/0 there)"
+            )
         if axis is None:
             beta0 = self.beta[0]
             if np.linalg.norm(beta0) < 1e-12:
@@ -1316,6 +1401,13 @@ class BKIntegrator:
         if split is not None and n_inner is None:
             n_inner = int(n_theta)
 
+        # Effective panels: cone_bands raises on a split that cannot be honoured
+        # instead of silently returning a single panel (the metadata used to
+        # record the requested split even when it was dropped).
+        bands = cone_bands(theta_max, n_theta, split, n_inner)
+        two_panel = len(bands) == 2
+        edge_offset = bands[0][1] * n_phi if two_panel else 0
+
         dirs, dom = cone_directions(axis, theta_max, n_theta, n_phi,
                                     split=split, n_inner=n_inner)
 
@@ -1324,7 +1416,7 @@ class BKIntegrator:
         dW = dE / omega_grid
 
         sampling, adequacy = self.adequacy(omega_grid, dirs)
-        edge = angular_edge_fraction(d2E, dom, n_phi)
+        edge = angular_edge_fraction(d2E, dom, n_phi, offset=edge_offset)
         if self.checks == "ignore":
             convergence, probe_omega = float("nan"), np.array([])
         else:
@@ -1364,8 +1456,10 @@ class BKIntegrator:
             t_span=(float(self.time[0]), float(self.time[-1])),
             theta_max=float(theta_max),
             theta_max_auto=bool(auto),
-            theta_split=None if split is None else float(split),
-            n_inner=None if n_inner is None else int(n_inner),
+            # effective grid actually used by cone_directions (bands), not the
+            # requested split/n_inner
+            theta_split=float(bands[0][0]) if two_panel else None,
+            n_inner=int(bands[0][1]) if two_panel else None,
             n_theta=int(n_theta),
             n_phi=int(n_phi),
             backend=self.backend,

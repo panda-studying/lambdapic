@@ -13,7 +13,10 @@ These pin the conventions that the coarse validation script
   harmonics reproduces the exact constant-field quantum synchrotron spectrum
   (recoil phase, ``(eps^2 + eps'^2)/2eps'^2`` prefactor, ``omega^2/gamma^2``
   term) to ``O(1/gamma^2)`` for both kernel forms;
-* ``Parameters`` options are honoured and invalid input is rejected.
+* ``Parameters`` options are honoured and invalid input is rejected;
+* ``Trajectory`` validates its own input (monotonic, finite) and carries no
+  inert ``mass``/``charge``; zero/negative ``omega`` is rejected; the angular
+  edge diagnostic points at the cone edge rather than at the axis node.
 """
 
 import warnings
@@ -26,7 +29,8 @@ from lambdapic.core.qed.baier_katkov import kernel as bkk
 from lambdapic.core.qed.baier_katkov import reference as bkr
 from lambdapic.core.qed.baier_katkov import validation as bkv
 from lambdapic.core.qed.baier_katkov import coherence as bkc
-from lambdapic.core.qed.baier_katkov.types import Parameters, Trajectory
+from lambdapic.core.qed.baier_katkov.trajectory import as_trajectory
+from lambdapic.core.qed.baier_katkov.types import Parameters, Spectrum, Trajectory
 from lambdapic.core.qed.baier_katkov.units import fine_structure, natural_time_unit
 
 # Most tests here are *structural* checks that deliberately use non-production
@@ -63,7 +67,7 @@ def energy_varying_circle(gamma0, n_samples, delta, turns=1.0):
     itself (no finite-record boundary term), while ``gamma`` sweeps over an
     ``O(1)`` range -- the regime where the fixed incident energy of P-2 is
     wrong.  The momentum ``u = gamma beta`` is built on shell, so the local
-    energy ``eps = mass * gamma`` is exactly consistent with ``beta``.
+    energy ``eps = gamma`` (``m_e = 1``) is exactly consistent with ``beta``.
     """
     T0 = 1.0
     t = np.linspace(0.0, turns * T0, n_samples)
@@ -849,3 +853,202 @@ def test_coherence_line_has_no_width_at_one_turn():
     row = bkc.turn_spectrum(5.0, 0.5, 0.5, 1, n_omega=11)
     width = bkc.measure_line_width(row["omega"], row["dE_domega"], row["i_centre"])
     assert np.isnan(width)
+
+
+# --------------------------------------------------------------------------
+# Second review round (2026-09-12): angular-diagnostic node, omega = 0 guards,
+# Trajectory input validation, and the removal of the inert mass/charge fields.
+# --------------------------------------------------------------------------
+
+
+def _review_circle(gamma=10.0, n_samples=256):
+    """One closed turn at ``chi = 0.5`` plus its recoil-shifted first harmonic."""
+    rho = gamma ** 2 * (1.0 - 1.0 / gamma ** 2) / 0.5
+    traj, _, Omega = bkv.circle_trajectory(gamma=gamma, rho=rho, n_samples=n_samples)
+    omega = float(bkr.recoil_shifted_harmonic([1], Omega, gamma)[0])
+    return traj, omega
+
+
+def test_angular_edge_fraction_points_at_the_cone_edge():
+    """The edge node is the *first* entry of the outer panel, not the last.
+
+    ``cone_directions`` stores each panel with ``theta`` descending, so the node
+    nearest ``theta_max`` is the first ``n_phi`` entries of the outer panel.
+    The old ``d2E[:, -n_phi:]`` slice read the node nearest the *axis*, so it
+    reported a small number exactly when the cone was truncating.
+    """
+    dom = np.ones(4)
+    assert bki.angular_edge_fraction(
+        np.array([[1.0, 0.0, 0.0, 0.0]]), dom, 1, offset=0)[0] == pytest.approx(1.0)
+    assert bki.angular_edge_fraction(
+        np.array([[0.0, 0.0, 0.0, 1.0]]), dom, 1, offset=0)[0] == pytest.approx(0.0)
+    # two-panel grid: outer panel begins at ``n_inner * n_phi``
+    assert bki.angular_edge_fraction(
+        np.array([[0.0, 0.0, 1.0, 0.0]]), dom, 1, offset=2)[0] == pytest.approx(1.0)
+
+    # the ordering assumption itself: theta descends, widest angle first
+    dirs, _ = bki.cone_directions([0.0, 0.0, 1.0], 1.0, 4, 1)
+    theta = np.arccos(dirs[:, 2])
+    assert np.all(np.diff(theta) < 0.0)
+    assert theta[0] == pytest.approx(1.0, abs=0.05)   # closest to theta_max
+
+
+def test_angular_edge_fraction_metadata_matches_the_widest_node():
+    """The reported fraction equals the true share of the node at ``theta_max``."""
+    traj, omega = _review_circle()
+    grid = np.array([omega])
+    n_theta, n_phi = 8, 4
+    spec = bki.compute_spectrum(traj, Parameters(epsilon=10.0), grid,
+                                theta_max=0.6, n_theta=n_theta, n_phi=n_phi,
+                                checks="ignore")
+    axis = traj.beta()[0]
+    axis = axis / np.linalg.norm(axis)
+    dirs, dom = bki.cone_directions(axis, 0.6, n_theta, n_phi)
+    d2 = bki.BKIntegrator(traj, Parameters(epsilon=10.0)).d2_energy_batch(grid, dirs)
+    d2 = d2.reshape(n_theta, n_phi)
+    dom = dom.reshape(n_theta, n_phi)
+    total = np.sum(d2 * dom)
+    widest = np.sum(d2[0] * dom[0]) / total
+    nearest_axis = np.sum(d2[-1] * dom[-1]) / total
+    assert spec.metadata["angular_edge_fraction"][0] == pytest.approx(widest, rel=1e-12)
+    # the two nodes carry visibly different shares, so the assertion has teeth
+    assert abs(widest - nearest_axis) > 1e-2
+
+
+def test_zero_and_negative_omega_are_rejected():
+    """``dW/domega = dE/domega / omega`` is 0/0 at ``omega = 0``.
+
+    Every entry point that forms that quotient rejects non-positive photon
+    energies instead of returning a silently propagating NaN or a bare
+    ``ZeroDivisionError``; ``d2_energy`` (prefactor carries ``omega^2``) stays
+    well defined and is exactly zero there.
+    """
+    traj, omega = _review_circle()
+    params = Parameters(epsilon=10.0)
+    n_hat = np.array([1.0, 0.0, 0.0])
+    integrator = bki.BKIntegrator(traj, params)
+
+    with pytest.raises(ValueError, match="strictly positive"):
+        bki.compute_spectrum(traj, params, np.array([0.0, omega]))
+    with pytest.raises(ValueError, match="strictly positive"):
+        bki.compute_spectrum(traj, params, np.array([-omega, omega]))
+    with pytest.raises(ValueError, match="strictly positive"):
+        integrator.d2_probability_batch(np.array([0.0, omega]), [n_hat])
+    with pytest.raises(ValueError, match="strictly positive"):
+        integrator.d2_probability(0.0, n_hat)
+    with pytest.raises(ValueError, match="strictly positive"):
+        bki.d2_probability(traj.time, traj.position, traj.beta(), 0.0, n_hat, 10.0)
+    assert integrator.d2_energy(0.0, n_hat) == 0.0
+
+    with pytest.raises(ValueError, match="positive"):
+        Spectrum(omega=np.array([0.0]), dW_domega=np.array([1.0]))
+    with pytest.raises(ValueError, match="finite"):
+        Spectrum(omega=np.array([1.0]), dW_domega=np.array([np.nan]))
+    with pytest.raises(ValueError, match="finite"):
+        Spectrum(omega=np.array([1.0]), dW_domega=np.array([1.0]),
+                 dE_domega=np.array([np.inf]))
+
+
+def test_size_one_omega_array_is_accepted():
+    """``grid[i:i + 1]`` style calls work again on NumPy >= 2.
+
+    ``float(np.array([w]))`` raises ``TypeError`` there, which broke the
+    single-point entries for size-1 arrays while the batch entries accepted them.
+    """
+    traj, omega = _review_circle()
+    params = Parameters(epsilon=10.0)
+    n_hat = np.array([1.0, 0.0, 0.0])
+    integrator = bki.BKIntegrator(traj, params)
+    w1 = np.array([omega])
+
+    assert integrator.d2_energy(w1, n_hat) == pytest.approx(
+        integrator.d2_energy(omega, n_hat), rel=1e-12)
+    assert integrator.d2_probability(w1, n_hat) == pytest.approx(
+        integrator.d2_probability(omega, n_hat), rel=1e-12)
+    assert bki.d2_probability(traj.time, traj.position, traj.beta(), w1, n_hat, 10.0) \
+        == pytest.approx(
+            bki.d2_probability(traj.time, traj.position, traj.beta(), omega, n_hat, 10.0),
+            rel=1e-12)
+    with pytest.raises(ValueError, match="single omega"):
+        integrator.d2_energy(np.array([omega, omega]), n_hat)
+
+
+def test_trajectory_rejects_non_monotonic_and_non_finite():
+    """A bad record must fail loudly instead of yielding a plausible-looking value.
+
+    Non-monotonic times produce bogus trapezoid weights (a wrong-but-finite
+    spectrum), and a single NaN anywhere makes every returned value NaN while
+    both adequacy guards stay silent (NaN compares False).
+    """
+    t = np.linspace(0.0, 1.0, 5)
+    r = np.zeros((5, 3))
+    r[:, 0] = t
+    Trajectory(time=t, position=r)                      # baseline: accepted
+
+    shuffled = np.array([0.0, 0.2, 0.1, 0.3, 0.4])
+    with pytest.raises(ValueError, match="strictly increasing"):
+        Trajectory(time=shuffled, position=r)
+    with pytest.raises(ValueError, match="strictly increasing"):
+        as_trajectory(shuffled, r)                      # same check both ways
+    with pytest.raises(ValueError, match="finite"):
+        Trajectory(time=np.where(np.arange(5) == 3, np.inf, t), position=r)
+    with pytest.raises(ValueError, match="finite"):
+        Trajectory(time=t, position=np.where(np.arange(5)[:, None] == 2, np.nan, r))
+    with pytest.raises(ValueError, match="finite"):
+        Trajectory(time=t, position=r,
+                   momentum=np.where(np.arange(5)[:, None] == 2, np.nan, r))
+
+
+def test_trajectory_carries_no_inert_mass_or_charge():
+    """``mass``/``charge`` live on ``Parameters``, which alone governs the spectrum.
+
+    They used to be accepted on ``Trajectory`` and silently ignored, so a caller
+    who put ``q = 3`` there kept ``q = 1`` in the ``q^2`` prefactor.  The fields
+    are gone, which turns that trap into a ``TypeError``.
+    """
+    t = np.linspace(0.0, 1.0, 5)
+    r = np.zeros((5, 3))
+    r[:, 0] = t
+    with pytest.raises(TypeError):
+        Trajectory(time=t, position=r, charge=3.0)
+    with pytest.raises(TypeError):
+        Trajectory(time=t, position=r, mass=2.0)
+    with pytest.raises(TypeError):
+        as_trajectory(t, r, mass=2.0)
+
+    traj, omega = _review_circle()
+    n_hat = np.array([1.0, 0.0, 0.0])
+    q1 = bki.BKIntegrator(traj, Parameters(epsilon=10.0, charge=1.0)).d2_energy(omega, n_hat)
+    q3 = bki.BKIntegrator(traj, Parameters(epsilon=10.0, charge=3.0)).d2_energy(omega, n_hat)
+    assert q3 / q1 == pytest.approx(9.0, rel=1e-12)
+
+
+def test_invalid_split_raises_and_metadata_reports_the_effective_grid():
+    """``cone_bands`` is the single source of truth for the two-panel rule.
+
+    A split that cannot be honoured used to fall back to a single panel while
+    ``metadata['theta_split']`` still recorded the requested value.
+    """
+    with pytest.raises(ValueError, match="0 < split < theta_max"):
+        bki.cone_bands(1.0, 4, split=5.0, n_inner=8)
+    with pytest.raises(ValueError, match="together"):
+        bki.cone_bands(1.0, 4, split=0.3)
+    with pytest.raises(ValueError, match="together"):
+        bki.cone_bands(1.0, 4, n_inner=8)
+    assert bki.cone_bands(1.0, 4) == [(1.0, 4)]
+    assert bki.cone_bands(1.0, 4, split=0.3, n_inner=8) == [(0.3, 8), (1.0, 4)]
+
+    traj, omega = _review_circle()
+    grid = np.array([omega])
+    with pytest.raises(ValueError, match="0 < split < theta_max"):
+        bki.compute_spectrum(traj, Parameters(epsilon=10.0), grid,
+                             theta_max=1.0, n_theta=4, n_phi=1, split=5.0)
+    two = bki.compute_spectrum(traj, Parameters(epsilon=10.0), grid,
+                               theta_max=1.0, n_theta=4, n_phi=1,
+                               split=0.3, n_inner=8, checks="ignore")
+    assert two.metadata["theta_split"] == pytest.approx(0.3)
+    assert two.metadata["n_inner"] == 8
+    single = bki.compute_spectrum(traj, Parameters(epsilon=10.0), grid,
+                                  theta_max=1.0, n_theta=4, n_phi=1, checks="ignore")
+    assert single.metadata["theta_split"] is None
+    assert single.metadata["n_inner"] is None

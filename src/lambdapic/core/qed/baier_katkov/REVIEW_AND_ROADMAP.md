@@ -1,7 +1,7 @@
 # Baier–Katkov 模块审查报告与 PIC 集成路线图
 
-> 审查日期：2026-09-07；更新：2026-09-08（§2 缺陷全部修复、前因子 4π 修正、Numba 后端、pytest 回归）、2026-09-11（P-1/P-2 收尾、P-3 重新诊断 + 适用性守卫、**P-4 自适应锥角 + 两板网格 + 角度守卫，原文方向判断被实测推翻**）。范围：[baier_katkov/](lambdapic/src/lambdapic/core/qed/baier_katkov/) 全部源码（约 1400 行）+ 主模拟 QED 管线（[radiation.py](lambdapic/src/lambdapic/core/qed/radiation.py)、[optical_depth.py](lambdapic/src/lambdapic/core/qed/optical_depth.py)、[inline.py](lambdapic/src/lambdapic/core/qed/inline.py)、[simulation.py](lambdapic/src/lambdapic/simulation/simulation.py)）。
-> 所有"已确认"的缺陷都在本机（lambdapic 专用 venv，Python 3.11.9）上实际运行复现过。
+> 审查日期：2026-09-07；更新：2026-09-08（§2 缺陷全部修复、前因子 4π 修正、Numba 后端、pytest 回归）、2026-09-11（P-1/P-2 收尾、P-3 重新诊断 + 适用性守卫、**P-4 自适应锥角 + 两板网格 + 角度守卫，原文方向判断被实测推翻**）、**2026-09-12（第二轮独立审查：基线全绿复核 + Test B 复现；新增 BUG-7/8/9 与一批输入校验、文档、验证债问题，全部本机复现，集中在 §2.5；其中代码级问题同日全部修复，回归 51→58 例）**。范围：[baier_katkov/](lambdapic/src/lambdapic/core/qed/baier_katkov/) 全部源码（约 1400 行）+ 主模拟 QED 管线（[radiation.py](lambdapic/src/lambdapic/core/qed/radiation.py)、[optical_depth.py](lambdapic/src/lambdapic/core/qed/optical_depth.py)、[inline.py](lambdapic/src/lambdapic/core/qed/inline.py)、[simulation.py](lambdapic/src/lambdapic/simulation/simulation.py)）。
+> 所有"已确认"的缺陷都在本机实际运行复现过：第一轮在 Windows 专机（venv，Python 3.11.9），**第二轮在 Linux 集群（`/home/panda/lambdapic/.venv`，Python 3.12.7，numpy 2.4.4）**。
 
 ---
 
@@ -92,6 +92,63 @@ $$ \frac{d^2E}{d\omega\, d\Omega} = \frac{\alpha}{\pi}\,\omega^2 q^2\,\mathrm{Re
 - **`Trajectory.__post_init__` 不校验 `time.ndim == 1`**（`as_trajectory` 校验了），直接构造 2-D time 会在积分器里得到难以理解的错误。`Spectrum.__post_init__` 同理不校验 `dE_domega` 形状。→ 两处校验均已补上。
 - **`kernel.py` 里 `fine_structure` 只是重新导出**（[kernel.py:35](lambdapic/src/lambdapic/core/qed/baier_katkov/kernel.py#L35)），模块内未使用，建议从 `__all__` 移除以免误导。→ 已移除（全模块 grep 确认无人从 `kernel` 导入它）。
 - **`double_time_integral` 中 `kern` 对 `"velocity"` 会先赋成 trace 核再被覆盖**（[integrator.py:98-115](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L98-L115)），属于死代码路径，重构 dispatch 时一并清理。→ 随 BUG-2 一并清理。
+
+### 第二轮审查新发现（2026-09-12，全部已在本机复现）
+
+> **2026-09-12 同日修复**：本小节标题与"次级""文档债"两条列出的**代码级问题已全部修掉**（BUG-7/8/9 + 输入校验 + metadata 谎报），并补 7 个 pytest 用例钉住行为。回归 **58 例全过**（原 51 例全部保持通过），V1–V8 数值**逐位不变**（含 V6 的 `total_W = 6.599e-02`）。**未修**的只剩纯文档项：`kernel.airy_identity` 无调用者/无测试、V5 文档说过头、README §8 环境仍是 Windows 旧值、`phase.*` 公开函数不在计算路径上。修复清单见各行 ✅。
+>
+> 环境：Linux 集群，`/home/panda/lambdapic/.venv`（Python 3.12.7，numpy 2.4.4）。基线先行核实：V1–V8 全过（数值与本文档记录一致）、`tests/test_baier_katkov.py` **51 例全过**、单粒子示例端到端正常、Test B 复现三个主标度（$n^2$ 律偏差仍为 $+0.30\%$、$\Gamma=n$、线宽 $\propto1/n$）。
+
+#### BUG-7（中等，诊断报错位置）✅ 已修复：`angular_edge_fraction` 指向靠轴的节点，不是锥边缘节点
+
+[integrator.py:964](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L964) 用 `d2E[:, -n_phi:]` 取"最外侧 $\theta$ 节点"，docstring 断言"directions 按内板在前、外板在后排列，最后 `n_phi` 个样本是离 `theta_max` 最近的节点"。**这个断言与 `cone_directions` 的实际排序相反**：`cos_theta` 由 `roots_legendre` 升序节点构造，故 $\theta$ **降序**——索引 0 才是离 `theta_max` 最近的节点。
+
+复现（$n_\theta=4,\theta_{max}=1.0$）：各节点 $\theta=[0.9616,0.8065,0.5580,0.2533]$；只有索引 0 有值时返回 `0.0`，只有最后节点有值时返回 `1.0`——**判据完全反了**。真实谱上（$\gamma=10$ 圆、$\theta_{max}=0.6$、$n_\theta=8,n_\phi=4$）metadata 报 `angular_edge_fraction=0.033`，而真正锥边缘节点（$\theta=0.594=\theta_{max}$）承担 **38.6%** 的角积分。
+
+后果：README §3.7 与本文档 P-4(d) 把它推荐为"锥角够不够"的**免费判据**（"大 ⇒ 该抬高 `theta_max`"）。在闭环这种固定锥本就不收敛的情形（P-4(e)）它本应报警，却报出一个小值，**恰好掩盖了唯一该被它暴露的信号**。两板模式下标量取的是贴近 `split` 的节点，既不是边缘也不是轴，语义更含糊。
+
+**修复**：`angular_edge_fraction(d2E, dom, n_phi, offset=0)` 改取 `slice(offset, offset + n_phi)`；`compute_spectrum` 用新增的 `cone_bands` 算 `offset`（单板 `0`、两板 `n_inner * n_phi`）并传入；`cone_directions` 与 `cone_bands` 的 docstring 写明"板内 $\theta$ **递减**，离 $\theta_{max}$ 最近的节点是最后一板的**头** $n_\phi$ 个"。实测：修复后 metadata 的 `angular_edge_fraction` **精确等于**最宽 $\theta$ 节点的真实份额（同轴网格下两边都是 0.04932，相对误差 $10^{-12}$），而旧值 0.03265 是轴节点。新增 `test_angular_edge_fraction_points_at_the_cone_edge`（合成输入：边缘节点独占→1、轴节点独占→0、两板 `offset`）+ `test_angular_edge_fraction_metadata_matches_the_widest_node`（与真实谱最宽节点对拍，并断言两者份额之差 $>10^{-2}$，使断言有牙齿）。
+
+#### BUG-8（低-中，静默 NaN / 裸异常）✅ 已修复：$\omega=0$ 无守卫
+
+`d2E` 在 $\omega=0$ 处恰为 0（前因子 $\omega^2$），而 `dW = dE/omega`（[integrator.py:1324](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L1324)、733、1190）给出 $0/0$：实测 `dW_domega[0] = nan`、`total_probability() = nan`（NaN 静默传播到整张谱的积分），`d2_probability(omega=0.0)` 抛裸 `ZeroDivisionError`。`_final_energy` 与 `Spectrum.__post_init__` 都不拦 $\omega=0$、也不拒 NaN。BUG-3 只守了 $\omega\ge\varepsilon$ 这一端。
+
+**修复**：`compute_spectrum` 的网格校验 + `d2_probability`/`BKIntegrator.d2_probability`/`d2_probability_batch`/`Spectrum.__post_init__` 四处守卫，$\omega\le0$ 一律抛带解释的 `ValueError`（$\omega=0$ 的 `dE/d\omega` 本身有定义且为 0，仍可用 `d2_energy`）。附带修好 `formation_time`：$\omega\le0$ 处干净返回 $\inf$（物理上 $\tau_f\to\infty$），不再触发除零 RuntimeWarning；`record_adequacy` 原有逻辑把 $\inf$ 映射为"判据不适用"，正是 $\omega=0$ 应有的行为。新增 `test_zero_and_negative_omega_are_rejected`（含 `Spectrum` 拒 NaN/inf）。
+
+#### BUG-9（低-中，公开 API 危险）✅ 已修复：`Trajectory.mass` / `Trajectory.charge` 从不进入计算路径
+
+`Trajectory` 的 `mass`/`charge` 字段（[types.py:53-54](lambdapic/src/lambdapic/core/qed/baier_katkov/types.py#L53-L54)）被 README §6.1 当作有效字段列出，但积分器只读 `Parameters` 的对应字段（[integrator.py:1174](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L1174) 等）。实测：`Trajectory(charge=3.0)` 与默认**逐位相同**（3.655714e-07），只有 `Parameters(charge=3.0)` 生效（3.290142e-06，恰 ×9）；`Trajectory(mass=5.0)` 同样无效。`Trajectory.local_energy()` 全包无人调用。
+
+后果：阶段 D 的单位适配器若按 README 把电荷放在轨迹上，会**静默按 $q=1$ 计算**。与 BUG-1（`recoil` 静默忽略）同型。
+
+**修复**：选择"单一事实来源"而不是"让死字段生效"——`Trajectory` 的 `mass`/`charge` 字段与 `as_trajectory` 的对应参数已**删除**（`local_energy()` 的在壳回退随之改为 `gamma()`，自然单位下 $m_e=1$）。原来的写法留了两个能设电荷的地方，正是产生这个陷阱的原因；现在写在轨迹上会立刻 `TypeError`。`README §6.1` 同步说明。新增 `test_trajectory_carries_no_inert_mass_or_charge`（含 `Parameters.charge` 的 $q^2$ 比率验证）。
+
+#### 次级（输入校验缺失，2026-09-12）✅ 已全部修复
+
+- ✅ **`Trajectory` 不校验 `time` 严格递增**：`as_trajectory` 校验（[trajectory.py:45](lambdapic/src/lambdapic/core/qed/baier_katkov/trajectory.py#L45)），`Trajectory` 直接构造不校验。实测非单调时间被接受，`trapz_weights` 返回乱权重（`[0.1,0.05,0.05,0.15,0.05]`），谱给出**貌似合理的错值**而不报错。README §7 与示例都直接构造 `Trajectory`。→ 校验下沉到 `Trajectory.__post_init__`（报出具体是哪一对样本违反），`as_trajectory` 改为纯转发。
+- ✅ **有限性只对 `energy` 校验**：`position`/`momentum`/`time` 里一个 NaN 被接受，整条谱变 NaN，且 `SamplingWarning` 与 `RecordLengthWarning` **都不触发**（NaN 比较为 False，`np.any(nan >= 1)` 为假）——完全静默。PIC 里的丢失粒子会产生这种记录。→ `time`/`position`/`momentum` 全部加有限性校验。
+- ✅ **`split` 非法时静默退回单板，metadata 照记**：`cone_directions` 在 `not 0 < split < theta_max` 时丢弃 `split`/`n_inner`（[integrator.py:770](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L770)），但 `compute_spectrum` 仍写 `metadata["theta_split"]`（[integrator.py:1367](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L1367)）。实测 `split=5.0, theta_max=1.0` 返回单板 4 方向，而 metadata 报 `theta_split=5.0, n_inner=8`——**metadata 描述了没被使用的网格**。`compute_spectrum(..., n_inner=…)` 不带 `split` 时同样被静默忽略。→ 新增 `cone_bands` 作为两板规则的唯一事实来源：`split`/`n_inner` 必须成对、`split` 必须落在 $(0,\theta_{max})$，否则 `ValueError`；metadata 改记 `cone_bands` 的**实际**结果。
+- ✅ **size-1 数组 `omega` 抛 TypeError**（numpy ≥ 2）：`double_time_integral` 的 `omega = float(omega)`（[integrator.py:650](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L650)）对 `np.array([0.5])` 抛 `TypeError: only 0-dimensional arrays can be converted to Python scalars`；标量与 0-d 数组正常，batch 路径（`np.atleast_1d`）正常。逐点迭代 `grid[i:i+1]` 的调用方会撞上，numpy 1.x 下曾可用。→ 新增 `_as_scalar_omega`（接受标量/0 维/size-1 数组，尺寸 >1 报错），三个单点入口统一走它。
+
+#### 文档与验证债（2026-09-12）
+
+- **`kernel.airy_identity` 无人调用、零测试覆盖**：它在 `__all__` 里、被 README §6.4 与 docstring 说成"仅用于 validation V1"，但全树 grep 无调用者——`validation.check_airy_identity` 是**另一个函数**，公式内联重推（[validation.py:66](lambdapic/src/lambdapic/core/qed/baier_katkov/validation.py#L66)）。公开 API 与测试各自演化的典型入口。
+- **V5 文档说过头**：docstring/README §6.9 说直线记录上"BK ≈ LW"，实测 `BK=-2.83e-07` vs `LW=+1.86e-04`，比值 $1.5\times10^{-3}$，**两者并不一致**。物理无问题（dot 核的真空减除消掉直线项，有限记录 LW 振幅不消），是那句文档描述错误。
+- **`test_record_adequacy_tracks_the_open_arc_deficit` 没有检验它声称的物理**：三条轨迹是同一圆的 (1.0 圈,1200)、(0.5,600)、(0.25,300)——采样密度恒为 1200/圈、`_curvature_rate` 相同，故 $L/\tau_f$ 严格 $\propto$ 圈数（实测 1.5996/0.7998/0.3999），断言退化成一个阈值区间加一个构造上必然成立的单调性；docstring 里那张谱亏损表（0.89@0.9 圈 … $-0.19$@0.4 圈）**从未被执行**。
+- **`test_prefactor_constant` 是变更探测器**：断言 `PREFACTOR == fine_structure/(4π²)`，即 `integrator.py:123` 的定义式本身，不检验归一化（真正钉绝对归一化的是 V8 与 Schwinger 对照）。
+- **README §6.5 漏参数**：`BKIntegrator.__init__` 漏 `checks`，`compute_spectrum` 漏 `checks`/`split`/`n_inner`。
+- **README §8 环境整节是 Windows 旧值**（`d:/Desktop/...Scripts/python.exe`、Python 3.11、`PYTHONUTF8=1`、"C 扩展未编译"、V1–V8 约 17 s / pytest 约 10 s）；本文档第 4 行的"Python 3.11.9"同。本机实为 Linux、Python 3.12.7、C 扩展 16 个 `.so` 全编译、V1–V8 约 6 s、51 例 pytest 约 11 s。
+- **`phase.classical_phase`/`recoil_phase`/`local_recoil_phase` 不在计算路径上**：README §2.4/§6.3 把它们当作"计算所用的相位"，实际积分器用内联副本（[integrator.py:290](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L290)、328 及 numba 内核）。实测两者一致（$\le10^{-10}$），故**当前不是错误，是漂移风险**；`Parameters.epsilon_prime`/`recoil_factor` 同理未被计算使用。
+
+#### 已核查干净（负面结果，限定上条清单的边界）
+
+numpy/numba 双后端在**非均匀网格**上 × 3 核 × 2 相位 × 固定/局域能量一致到 $10^{-14}$；奇/偶 $N_t$ 配 `block ∈ {1,2,3,8,1000}` 的折行配对覆盖每行恰好一次；逐 $\omega$ 数组 `epsilon_prime`（套件未覆盖）两后端一致；局域核/相位的 numpy 与 numba 公式代数与数值同一；用文档函数（`phase.*`/`kernel.*`）独立重写的朴素 $\sum_{ij}w_iw_jNe^{-i\Phi}$ 能复现 `double_time_integral`；`kernel.trace_kernel`/`dot_kernel` 中"死"的局域分支与 `_local_vertex_arrays` 逐位一致；`trapz_weights`、`_beta_from_position`、两套方向网格的权重守恒、`_kernel_coefficients` 与核函数、`Parameters.recoil` → `(phase, epsilon_prime)` 映射均自洽。**V8 对 scipy Macdonald/Airy、V2 的精确代数恒等式、V7 的在壳恒等式、与项目 LCFA 表的交叉核对都确实独立，未发现循环论证。**
+
+#### 项目级（非代码）
+
+- **仓库位置（2026-09-14 更正）**：git 仓库在 `/home/panda/lambdapic/lambdapic`（分支 `main`），**不是**外层目录——外层 `/home/panda/lambdapic` 放的是虚拟环境、用户配置、参考书 PDF 等不入库的东西，所以在外层 `git log` 会报"不是仓库"。第二轮审查时据此误判为"无版本控制"，记录错误，此处更正。
+- **提交状态（2026-09-14）**：此前 09-11 与 09-12 两个会话的成果都只在工作区（最后一次提交是 2026-09-10 的 `253a0ac`；合并起来 10 个文件 +1703/−99，含 2 个未跟踪文件）。已按内容拆成两个提交落库：`411a63f`（09-11 的 P-3 守卫 / P-4 自适应锥角 / Test B，该快照单独跑 51 例全过）与 `2563766`（本轮的 BUG-7/8/9 与输入校验，58 例全过）。拆分方式：先整体回退本轮改动得到可验证的 09-11 快照并提交，再从备份恢复本轮状态提交——**中间态与终态各自都跑过 pytest 与 V1–V8**，用于确认回退没有过推或漏推。
+- **Test B 线能量列复现偏差**：本次复跑 $n=2,8,16$ 得 2.0029 / 7.9177 / 15.7285，本文档 §8.1 记的是 1.981 / 8.021 / 15.97（偏差 1.1–1.5%），而 §8.1 声称"$n\ge2$ 后线性到 0.2% 内"。三个主标度（$n^2$、$\Gamma$、线宽）逐位重现，只有"线能量"这个窗口积分量在 1% 量级上不可复现——不影响结论，但该行声称的精度需要下调。
 
 ---
 
@@ -414,6 +471,8 @@ $n=1$ 时比值为 1——那正是 V8 的结果。
 | ~~P2~~ ✅ | ~~Numba 化~~ 已完成 2026-09-08（约 140×） | — | §5 |
 | P2 | 带状截断（$O(N_t N_\omega)$）：**排在 PIC 集成之前的第二个理由**——它同时是多粒子成本（§7-D）与圈间相干判据（§8.1）的钥匙 | 1–2 d | §5, §7-C |
 | ~~P2~~ ✅ | ~~圈间相干判据实验~~ 已完成 2026-09-11（新文件 `coherence.py` + `coherence_plot.py`）：$n^2$ 律（偏差恒 $+0.30\%$，与 $n$ 无关）、$\Gamma=n$、线宽 $\propto1/n$、线能量 $\propto n$ **三个标度同时成立**。**未做**：带状截断不破坏 $n^2$ 的验证（$\gamma=5$ 下代价可承受，未启用截断） | — | §8.1 |
+| ~~P1~~ ✅ | ~~第二轮审查新缺陷~~ **已完成 2026-09-12**：BUG-7 角度边界诊断指向靠轴节点（实测把承担 38.6% 的边缘节点报成 0.033，掩盖了唯一该报警的信号）、BUG-8 $\omega=0$ 静默 NaN、BUG-9 `Trajectory.charge/mass` 死字段（字段已删，改 `TypeError`）、`Trajectory` 缺 time 单调性与有限性校验、metadata 在 `split` 非法时谎报网格。补 **7 个 pytest 用例**钉住行为，回归 **51→58 例**全过、V1–V8 数值逐位不变 | 0.5 d | §2.5 |
+| ~~P1~~ ✅ | ~~提交未落库的成果~~ 已完成 2026-09-14：拆成 `411a63f`（09-11 成果）+ `2563766`（本轮审查修复）两个提交，工作区干净 | — | §2.5 |
 | P3 | 单位适配器 + 轨迹记录回调 + 系综求和 | 2–3 d | §7-D |
 | P4 | 在线事件采样 / 自旋分辨核 / NUFFT | 周级 | §7-D/E |
 

@@ -37,15 +37,15 @@ __all__ = [
 ]
 
 
-def as_trajectory(time, position, momentum=None, energy=None, mass=1.0, charge=1.0) -> Trajectory:
-    """Construct a :class:`Trajectory` from raw arrays, checking the ordering."""
-    time = np.asarray(time, dtype=np.float64)
-    if time.ndim != 1:
-        raise ValueError("time must be 1-D")
-    if np.any(np.diff(time) <= 0):
-        raise ValueError("time samples must be strictly increasing")
+def as_trajectory(time, position, momentum=None, energy=None) -> Trajectory:
+    """Construct a :class:`Trajectory` from raw arrays.
+
+    Ordering, positivity and finiteness are checked by
+    :meth:`Trajectory.__post_init__`; mass and charge live on
+    :class:`~.types.Parameters`, which alone governs the spectrum.
+    """
     return Trajectory(time=time, position=position, momentum=momentum,
-                      energy=energy, mass=mass, charge=charge)
+                      energy=energy)
 
 
 def uniform_trajectory(r_of_t, t0, t1, n_samples, **kwargs) -> Trajectory:

@@ -45,7 +45,7 @@ def full_circle_trajectory(gamma=10.0, rho=200.0, n_samples=512):
     u_perp = gamma * beta
     u = np.column_stack([-u_perp * np.sin(phi), u_perp * np.cos(phi), np.zeros_like(t)])
 
-    return Trajectory(time=t, position=r, momentum=u, mass=1.0, charge=1.0), Omega
+    return Trajectory(time=t, position=r, momentum=u), Omega
 
 
 def main() -> None:

@@ -172,6 +172,8 @@ $$I = \sum_{i,j} w_i w_j\, N(t_i, t_j)\, e^{-i\Phi(t_i, t_j)}, \qquad w = \text{
 角积分谱由方向锥面上的数值求积得到：
 
 - `integrator.cone_directions(axis, theta_max, n_theta, n_phi, split=None, n_inner=None)`：$\cos\theta$ 用 **Gauss–Legendre** 采样（区间 $[\cos\theta_{max}, 1]$），$\phi$ 均匀采样；返回方向数组 $(n_\theta n_\phi, 3)$ 与每个方向的立体角权重 $d\Omega$（总和恰为锥面立体角 $2\pi(1-\cos\theta_{max})$）。传 `split`/`n_inner` 时启用**两板规则**（$[0,\text{split}]$ 用 $n_{inner}$ 个节点 + $[\text{split},\theta_{max}]$ 用 $n_\theta$ 个）；单板是默认且与历史行为逐位相同。
+  - **排序约定（下游诊断依赖它）**：内板在前、外板在后，每板内 $\phi$ 连续成组；板内 $\theta$ **递减**（Gauss–Legendre 节点按 $\cos\theta$ 升序存储），所以**离 $\theta_{max}$ 最近的节点是最后一板的头 $n_\phi$ 个**，不是尾 $n_\phi$ 个。
+  - `integrator.cone_bands(theta_max, n_theta, split, n_inner)` 是两板规则的唯一事实来源，返回本次**实际生效**的板 `[(bound, n_nodes), ...]`。`split`/`n_inner` 必须**成对给出**，且 `split` 必须落在 $(0,\theta_{max})$ 内，否则**抛 `ValueError`**——早期版本遇到非法 `split` 会静默退回单板，而 `metadata["theta_split"]` 照记请求值（即 metadata 谎报网格）。`metadata` 现在记录的是 `cone_bands` 的实际结果。
 - `reference.orbit_direction_grid(gamma, ...)`：x-y 平面圆轨道的专用网格——利用绕 z 轴方位对称与轨道平面对称，只取上半球 $\phi = 0$ 的仰角 $\psi$ 方向，权重带 $2\cdot 2\pi\cos\psi\,d\psi$；内锥（默认半宽 $8/\gamma$，同步辐射锥）与外区各用一组 Gauss–Legendre。
 - `BKIntegrator.compute_spectrum` 默认锥轴为初始速度方向。`theta_max=None`（默认）时锥角**自适应**（`integrator.default_theta_max`）：
 
@@ -288,12 +290,11 @@ validation.py  V1–V8  ──► validation_plot.py ──► validation_summar
 | `momentum` | `(Nt, 3)` 或 None | **归一化动量** $\mathbf u = \gamma\boldsymbol\beta$（与 λPIC 的 `ux, uy, uz` 同约定）；无则从位置差分恢复 |
 | `energy` | `(Nt,)` 或 None | 局域能量历史 $\varepsilon(t_i)$。**一旦给出即切换到局域能量模式**（[§2.4](#24-局域能量推广-p-2)）：核与相位改用 $\varepsilon(t_1), \varepsilon(t_2)$ 与逐顶点反冲 $\varepsilon'_i = \varepsilon_i - \omega$。这就是把 PIC 能量历史（加速电子）喂进模块的入口。要求全部为正有限值 |
 
-| `mass` | float | 质量（自然单位，电子 $=1$） |
-| `charge` | float | 电荷重数 $\lvert q\rvert/e$（谱按 $q^2$ 标度） |
+**质量与电荷不在 `Trajectory` 上**：一条 BK 谱只由 `Parameters` 决定（`Parameters.mass` 进核，`Parameters.charge` 进 $q^2$ 前因子）。早期版本在本数据类上暴露过 `mass`/`charge` 字段，但它们**从不进入计算路径**——调用方把 $q=3$ 写在那里，前因子仍是 $q=1$。字段已删除，该陷阱现在是 `TypeError`。
 
 方法/校验：
 
-- `__post_init__()`：类型转换与全部形状/正性校验。
+- `__post_init__()`：类型转换与全部形状校验——`time` 一维且**严格递增**、`time`/`position`/`momentum`/`energy` 全部**有限**、`energy` 为正、`Nt >= 2`。这些校验必须在源头挡住坏记录：非单调时间会让 `trapz_weights` 给出乱权重（一个貌似合理的错值），而位置里一个 NaN（PIC 里的丢失粒子）会让整条谱变 NaN，且两个适用性守卫都不触发（NaN 比较为 False）。
 - `n_samples`（property）：采样数 $N_t$。
 - `beta()`：有 `momentum` 时用在壳精确式 $\boldsymbol\beta = \mathbf u/\sqrt{1+\lvert\mathbf u\rvert^2}$；否则对 `position` 中心差分（放大采样噪声，生产勿用）。
 - `gamma()`：有 `momentum` 时 $\gamma = \sqrt{1+\lvert\mathbf u\rvert^2}$；否则 $1/\sqrt{1-\beta^2}$。
@@ -308,6 +309,7 @@ validation.py  V1–V8  ──► validation_plot.py ──► validation_summar
 
 **`Spectrum`**：单粒子微分谱结果容器。字段：`omega`（$(N_\omega,)$）、`dW_domega`（$dW/d\omega$，主输出，无量纲）、`dE_domega`（可选，$dE/d\omega = \omega\,dW/d\omega$）、`metadata`（来源信息字典：$\varepsilon$、是否局域能量、质量、电荷、反冲/核类型、采样数、时间跨度、$\theta_{max}$、方向网格、后端、单位制等）。方法：
 
+- `__post_init__()`：校验 `omega` **有限且严格为正**（$\omega=0$ 处 $dW/d\omega = (0/0)$ 无定义，见下）、`dW_domega`/`dE_domega` 有限且与 `omega` 同形。这是"静默 NaN 谱"的最后一道防线。
 - `total_probability()`：$W = \int d\omega\, dW/d\omega$（梯形）。
 - `total_energy()`：$E = \int d\omega\, dE/d\omega$。
 
@@ -374,18 +376,20 @@ validation.py  V1–V8  ──► validation_plot.py ──► validation_summar
 - `double_time_integral_batch(time, position, beta, omega, dirs, epsilon, mass=1.0, kernel="dot", epsilon_prime=None, phase="recoil", backend="auto", block=None, chunk=256, energy=None)`：主批量入口——对每个 $(\omega_k, \mathbf n_d)$ 对返回 $\mathrm{Re}\iint N e^{-i\Phi}$，形状 $(N_\omega, N_{dir})$。`energy` 给出时切换到局域能量模式（此时 `epsilon`/`epsilon_prime` 不再使用）。所有公开入口（下同）在局域模式下只支持 `dot`/`trace` 核。
 - `double_time_integral(time, position, beta, omega, n, epsilon, ..., energy=None)`：单个 $(\omega, n)$ 的**复数**积分 $I$。numpy 后端虚部为舍入诊断；numba 后端虚部构造性为零。
 - `d2_energy(time, position, beta, omega, n, epsilon, ..., diagnostics=False, energy=None)`：$d^2E/(d\omega\,d\Omega) = (\alpha/4\pi^2)\,\omega^2 q^2\,\mathrm{Re}\,I$；`diagnostics=True` 时返回 `(值, 虚部)`。
-- `d2_probability(...)`：$d^2W/(d\omega\,d\Omega) = d^2E/(d\omega\,d\Omega)/\omega$，同样支持 `diagnostics`。
+- `d2_probability(...)`：$d^2W/(d\omega\,d\Omega) = d^2E/(d\omega\,d\Omega)/\omega$，同样支持 `diagnostics`。**要求 $\omega>0$**：$dE/d\omega$ 带 $\omega^2$，故 $\omega=0$ 处商是 $0/0$，这里抛 `ValueError` 而不是返回 NaN 或裸 `ZeroDivisionError`（$\omega=0$ 的 $dE/d\omega$ 本身有定义且为 0，用 `d2_energy`）。三个单点入口都经 `_as_scalar_omega` 接受标量、0 维数组或**长度为 1 的数组**（`grid[i:i+1]` 形式；NumPy ≥ 2 下 `float(np.array([w]))` 会抛 `TypeError`）。
 - `classical_d2_energy(time, position, beta, omega, n, charge=1.0)`：经典 LW 参考谱 $(\alpha/4\pi^2)\,\omega^2\lvert A\rvert^2$（validation 用）。
-- `cone_directions(axis, theta_max, n_theta, n_phi)`：锥面方向网格与立体角权重（[§3.4](#34-角度积分)）。
+- `cone_directions(axis, theta_max, n_theta, n_phi, split=None, n_inner=None)`：锥面方向网格与立体角权重（[§3.4](#34-角度积分)）。
+- `cone_bands(theta_max, n_theta, split=None, n_inner=None)`：本次**实际生效**的方向板（两板规则的唯一事实来源；`split`/`n_inner` 必须成对、且 `0 < split < theta_max`，否则抛 `ValueError`，见 [§3.4](#34-角度积分)）。
+- `angular_edge_fraction(d2E, dom, n_phi, offset=0)`：最外层 $\theta$ 节点承担的角积分份额（免费诊断）。`offset` 是该节点的起始下标：单板为 `0`，两板为 `n_inner * n_phi`，由 `cone_bands` 构造（[§3.7](#37-适用性守卫采样混叠记录长度与角度分辨)）。
 - `_recoil_args(params)`：把 `Parameters.recoil` 映射到积分器的 `(phase, epsilon_prime)` 组合。
 
 **面向用户的包装**
 
-- `BKIntegrator`：捆绑一条轨迹、一组参数与一个后端的便捷类。`__init__(trajectory, params, backend="auto")` 缓存 `time/position/beta/energy`。方法：
-  - `d2_energy_batch(omega_grid, dirs)` / `d2_probability_batch(omega_grid, dirs)`：整张 $(N_\omega, N_{dir})$ 网格。
-  - `d2_energy(omega, n)` / `d2_probability(omega, n)`：单点。
-  - `compute_spectrum(omega_grid, theta_max=None, n_theta=16, n_phi=8, axis=None)`：角积分谱（[§3.4](#34-角度积分)），返回带 metadata 的 `Spectrum`。
-- `compute_spectrum(trajectory, params, omega_grid, ...)`：模块级便捷函数（构造 `BKIntegrator` 后直接求谱）。
+- `BKIntegrator`：捆绑一条轨迹、一组参数与一个后端的便捷类。`__init__(trajectory, params, backend="auto", checks="warn")` 缓存 `time/position/beta/energy`。方法：
+  - `d2_energy_batch(omega_grid, dirs)` / `d2_probability_batch(omega_grid, dirs)`：整张 $(N_\omega, N_{dir})$ 网格；后者要求 `omega_grid` 有限且严格为正。
+  - `d2_energy(omega, n)` / `d2_probability(omega, n)`：单点；后者要求 $\omega>0$（见上）。
+  - `compute_spectrum(omega_grid, theta_max=None, n_theta=16, n_phi=8, axis=None, split=None, n_inner=None)`：角积分谱（[§3.4](#34-角度积分)），返回带 metadata 的 `Spectrum`；`omega_grid` 必须有限且严格为正。
+- `compute_spectrum(trajectory, params, omega_grid, theta_max=None, n_theta=16, n_phi=8, axis=None, split=None, n_inner=None, backend="auto", checks="warn")`：模块级便捷函数（构造 `BKIntegrator` 后直接求谱）。
 
 ### 6.6 `reference.py` — 解析参考谱（仅验证用）
 
@@ -526,12 +530,13 @@ python -m pytest tests/test_baier_katkov.py -n 0 -q -m "not slow"   # 跳过全�
 ## 9. 验证与回归测试
 
 - **V1–V8 套件**（[§6.9](#69-validationpy--v1v8-验证套件)）约 17 s，覆盖相位符号、积分器自洽、经典极限、绝对归一化（Larmor）、直线零辐射、谱正性、核恒等式、量子同步辐射谱对照。当前全部通过。
-- **pytest 回归**（`tests/test_baier_katkov.py`）共 51 例：
+- **pytest 回归**（`tests/test_baier_katkov.py`）共 58 例：
   - 固定能量路径 23 例（含 BUG 修复回归、两后端一致性、V8 类对照、慢速全谱扫描 2 例）；
   - 局域能量路径 12 例（2026-09-09 新增，7 个测试函数）：恒能量退化回固定路径（$10^{-16}$）、局域 dot ≡ trace、numba ≡ numpy（$10^{-15}$）、厄米性（虚部 $10^{-16}$）、谱正性、经典模式能量无关（$10^{-12}$）、入参校验；测试轨迹为精确闭合、在壳、能量变化的圆轨道（$\gamma$ 扫 7→13）；
   - 适用性守卫 5 例（P-3：Nyquist 边界、开弧亏损、可控制性、直线不适用、metadata）；
   - 角度守卫 8 例（2026-09-11 P-4，8 个测试函数）：两板权重守恒、$\theta_c$ 标度与方向、速度摆幅、自适应锥角、守卫阈值对实测精度边界、摆动记录必报警、`checks` 可控制性、metadata 角度诊断；
-  - Test B 圈间相干 3 例（2026-09-11，[coherence.py](coherence.py)）：$\omega$ 窗口落在反冲移动谐波上且间距 $=\Omega(\varepsilon'/\varepsilon)^2$、线中心密度 $\propto n^2$（$n=1,2$ 两点）、单圈线宽不可测（Dirichlet 核恒为 1）。
+  - Test B 圈间相干 3 例（2026-09-11，[coherence.py](coherence.py)）：$\omega$ 窗口落在反冲移动谐波上且间距 $=\Omega(\varepsilon'/\varepsilon)^2$、线中心密度 $\propto n^2$（$n=1,2$ 两点）、单圈线宽不可测（Dirichlet 核恒为 1）；
+  - **第二轮审查修复 7 例（2026-09-12）**：角度边界诊断指向锥边缘节点（合成输入 + 与真实谱最宽节点份额对拍）、$\omega=0$/负值在 `compute_spectrum`/`d2_probability[_batch]`/`Spectrum` 全被拒、size-1 数组 `omega` 可被单点入口接受、`Trajectory` 拒绝非单调时间与非有限量、`Trajectory`/`as_trajectory` 不再接受 `mass`/`charge`（改为 `TypeError`，并验证 `Parameters.charge` 的 $q^2$ 生效）、非法 `split` 抛错且 metadata 报告生效网格。
 
 ---
 

@@ -95,7 +95,7 @@ def circle_trajectory(gamma, rho, n_samples=512, turns=1.0):
     r = np.column_stack([rho * np.cos(phi), rho * np.sin(phi), np.zeros_like(t)])
     u_perp = gamma * beta
     u = np.column_stack([-u_perp * np.sin(phi), u_perp * np.cos(phi), np.zeros_like(t)])
-    return Trajectory(time=t, position=r, momentum=u, mass=1.0, charge=1.0), beta, Omega
+    return Trajectory(time=t, position=r, momentum=u), beta, Omega
 
 
 def straight_trajectory(gamma, T=100.0, n_samples=256):
@@ -104,7 +104,7 @@ def straight_trajectory(gamma, T=100.0, n_samples=256):
     t = np.linspace(0.0, T, n_samples)
     r = np.column_stack([beta * t, np.zeros_like(t), np.zeros_like(t)])
     u = np.tile([gamma * beta, 0.0, 0.0], (n_samples, 1))
-    return Trajectory(time=t, position=r, momentum=u, mass=1.0, charge=1.0)
+    return Trajectory(time=t, position=r, momentum=u)
 
 
 def harmonics_for_deltas(deltas, Omega, epsilon):

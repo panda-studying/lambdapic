@@ -34,24 +34,24 @@ class Trajectory:
         incident energy of :class:`Parameters` to the sec. 4.2 local-energy
         generalization: the phase and kernel use ``eps(t1), eps(t2)`` with
         per-vertex recoil ``eps'_i = eps_i - omega``.  On the mass shell the
-        default local energy is ``mass * gamma``; supplying ``energy`` is how
-        one feeds a PIC energy history (accelerating electrons) into the
-        module.  Values must be positive; consistency with ``momentum``
-        (``eps_i = mass * sqrt(1 + |u_i|^2)``) is the caller's responsibility
-        -- the kernel assumes ``|beta_i|^2 = 1 - m^2/eps_i^2``.
-    mass:
-        Particle mass in natural units (``m_e = 1`` for electrons).
-    charge:
-        Charge multiplicity ``|q| / e`` (magnitude only; the spectrum scales
-        with ``charge^2``).  Default 1 for a single electron.
+        default local energy is ``gamma`` (``m = m_e = 1`` in natural units);
+        supplying ``energy`` is how one feeds a PIC energy history
+        (accelerating electrons) into the module.  Values must be positive;
+        consistency with ``momentum``
+        (``eps_i = sqrt(1 + |u_i|^2)``) is the caller's responsibility -- the
+        kernel assumes ``|beta_i|^2 = 1 - 1/eps_i^2``.
+
+    The particle's mass and charge are **not** carried here: a BK spectrum is
+    governed by :class:`Parameters` alone (``Parameters.mass``,
+    ``Parameters.charge`` scale the kernel and the ``q^2`` prefactor).  An
+    earlier version exposed inert ``mass``/``charge`` fields on this dataclass
+    that silently did nothing -- set them on :class:`Parameters`.
     """
 
     time: np.ndarray
     position: np.ndarray
     momentum: Optional[np.ndarray] = None
     energy: Optional[np.ndarray] = None
-    mass: float = 1.0
-    charge: float = 1.0
 
     def __post_init__(self) -> None:
         self.time = np.asarray(self.time, dtype=np.float64)
@@ -64,10 +64,23 @@ class Trajectory:
             raise ValueError("position must have shape (Nt, 3)")
         if self.time.shape[0] != self.position.shape[0]:
             raise ValueError("time and position must have the same length")
+        if not np.all(np.isfinite(self.time)):
+            raise ValueError("time values must be finite")
+        steps = np.diff(self.time)
+        if not np.all(steps > 0.0):
+            bad = int(np.argmax(steps <= 0.0))
+            raise ValueError(
+                "time must be strictly increasing: "
+                f"t[{bad}]={self.time[bad]!r} -> t[{bad + 1}]={self.time[bad + 1]!r}"
+            )
+        if not np.all(np.isfinite(self.position)):
+            raise ValueError("position values must be finite")
         if self.momentum is not None:
             self.momentum = np.asarray(self.momentum, dtype=np.float64)
             if self.momentum.shape != self.position.shape:
                 raise ValueError("momentum must have shape (Nt, 3)")
+            if not np.all(np.isfinite(self.momentum)):
+                raise ValueError("momentum values must be finite")
         if self.energy is not None:
             self.energy = np.asarray(self.energy, dtype=np.float64)
             if self.energy.shape != (self.time.shape[0],):
@@ -99,12 +112,13 @@ class Trajectory:
         """Local electron energy ``eps(t_i)`` at each sample.
 
         Returns the explicit ``energy`` history when one was supplied;
-        otherwise falls back to the on-shell value ``mass * gamma`` (exact
-        for a trajectory carrying normalized momentum ``u``).
+        otherwise falls back to the on-shell value ``gamma`` (exact for a
+        trajectory carrying normalized momentum ``u``, with ``m = m_e = 1``
+        in natural units).
         """
         if self.energy is not None:
             return self.energy
-        return self.mass * self.gamma()
+        return self.gamma()
 
 
 def _beta_from_position(time: np.ndarray, position: np.ndarray) -> np.ndarray:
@@ -229,6 +243,17 @@ class Spectrum:
             raise ValueError("omega and dW_domega must have the same shape")
         if self.dE_domega is not None and self.dE_domega.shape != self.omega.shape:
             raise ValueError("dE_domega must have the same shape as omega")
+        if not np.all(np.isfinite(self.omega)) or np.any(self.omega <= 0.0):
+            raise ValueError(
+                "omega must be finite and positive: dW/domega = dE/domega / omega "
+                "is undefined at omega = 0 (dE/domega carries omega^2, so the "
+                "quotient is 0/0 there), and a NaN would otherwise propagate "
+                "silently into total_probability()"
+            )
+        if not np.all(np.isfinite(self.dW_domega)):
+            raise ValueError("dW_domega must be finite")
+        if self.dE_domega is not None and not np.all(np.isfinite(self.dE_domega)):
+            raise ValueError("dE_domega must be finite")
 
     def total_probability(self) -> float:
         """Integrated emission probability ``W = int domega dW/domega``."""
