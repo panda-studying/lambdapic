@@ -70,8 +70,12 @@ def main(save_path=None) -> str:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    plt.rcParams["font.family"] = "sans-serif"
-    plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
+    # Per-glyph font fallback needs ``font.family`` itself to be the *list*:
+    # setting ``font.family = "sans-serif"`` plus a ``font.sans-serif`` list does
+    # NOT chain, and on this machine (no YaHei/SimHei installed) every Chinese
+    # label then renders as a tofu box.
+    plt.rcParams["font.family"] = ["DejaVu Sans", "Droid Sans Fallback",
+                                   "Microsoft YaHei", "SimHei"]
     plt.rcParams["axes.unicode_minus"] = False
 
     # -- re-run all checks -------------------------------------------------

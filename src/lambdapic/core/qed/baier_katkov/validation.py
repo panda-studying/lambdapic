@@ -122,6 +122,11 @@ def harmonics_for_deltas(deltas, Omega, epsilon):
 # V2: |classical amplitude|^2 == velocity-kernel double integral
 # --------------------------------------------------------------------------
 def check_velocity_kernel_consistency():
+    # This is a *discrete* algebraic identity: |sum_i w_i v_i e^{i psi_i}|^2
+    # expands exactly into the trapezoid double sum of the velocity kernel, so
+    # it holds on any grid.  The grid here is deliberately coarse (the point is
+    # the identity, not a physical spectrum), hence checks="ignore" -- the
+    # sampling guard would otherwise flag a value that is never used as physics.
     traj, _, _ = circle_trajectory(gamma=50.0, rho=2000.0, n_samples=300)
     n = np.array([0.0, 0.5, np.sqrt(1.0 - 0.5 ** 2)])
     omega = 1.0
@@ -130,7 +135,7 @@ def check_velocity_kernel_consistency():
     via_sq = float(np.sum(np.abs(amp) ** 2))
     via_double = double_time_integral(
         traj.time, traj.position, traj.beta(), omega, n,
-        epsilon=50.0, kernel="velocity", phase="classical",
+        epsilon=50.0, kernel="velocity", phase="classical", checks="ignore",
     ).real
 
     rel = abs(via_double - via_sq) / abs(via_sq)

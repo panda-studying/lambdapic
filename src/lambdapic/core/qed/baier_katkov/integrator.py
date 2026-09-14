@@ -46,9 +46,40 @@ is the fundamental one there.  The pair kernel remains symmetric and the
 pair phase antisymmetric under ``1 <-> 2``, so Hermitian symmetry
 (upper-triangle summation) and reality still hold.  The fixed-``eps`` path
 is unchanged and stays the default.
+
+Two adequacy guards protect the result from silently returning non-physics
+(``checks="warn"`` by default, ``"raise"`` / ``"ignore"`` available; see
+:func:`sampling_margin`, :func:`record_adequacy`):
+
+* **Trapezoid aliasing.**  The integrand oscillates at up to
+  ``omega (eps/eps') max|1 - n.v|``, so the step must satisfy the Nyquist
+  bound ``dt * that < pi``.  Beyond it the double sum returns an artifact --
+  arbitrarily large and of either sign -- not a spectrum.  On a circle this
+  is the familiar ``Nt > 4m`` (the ``Nt > 2m`` often quoted permits one
+  sample per oscillation and is measurably too lax).
+* **Record shorter than the formation time.**  For ``L <~ tau_f(omega)``
+  the integral is dominated by the hard record endpoints and under-reports,
+  going negative in the worst case.  ``tau_f`` grows towards low ``omega``,
+  so the soft-photon region is the first to suffer.
+
+Both are *diagnostics*, not corrections: they never change the computed
+value, only say whether it can be trusted.
+
+A third guard covers the angular integral
+(:class:`AngularConvergenceWarning`, raised by
+:meth:`BKIntegrator.compute_spectrum`): doubling ``n_theta``/``n_phi`` at a few
+probe frequencies must not move the angle-integrated ``dE/domega`` by more than
+``ANGULAR_RTOL``.  This one is not free -- it costs about ``4 n_probe /
+N_omega`` of the base angular integral -- but it catches exactly the failure
+mode the historical fixed ``5/gamma`` cone had, where a single wide
+Gauss--Legendre panel silently under-reported the soft-photon end.  The cone
+itself is now adapted to the record (:func:`default_theta_max`) and the
+``1/gamma`` core is split off as its own panel (:func:`cone_directions`).
 """
 
 from __future__ import annotations
+
+import warnings
 
 import numpy as np
 from scipy.special import roots_legendre
@@ -73,6 +104,17 @@ __all__ = [
     "d2_energy",
     "classical_d2_energy",
     "cone_directions",
+    "sampling_margin",
+    "formation_time",
+    "record_adequacy",
+    "velocity_swing",
+    "emission_half_angle",
+    "default_theta_max",
+    "angular_edge_fraction",
+    "ANGULAR_RTOL",
+    "SamplingWarning",
+    "RecordLengthWarning",
+    "AngularConvergenceWarning",
     "BKIntegrator",
     "compute_spectrum",
 ]
@@ -467,7 +509,8 @@ def _check_local_energy(energy, nt, kernel, epsilon_prime):
 
 def double_time_integral_batch(time, position, beta, omega, dirs, epsilon, mass=1.0,
                                kernel="dot", epsilon_prime=None, phase="recoil",
-                               backend="auto", block=None, chunk=256, energy=None):
+                               backend="auto", block=None, chunk=256, energy=None,
+                               checks="warn"):
     """``Re int dt1 dt2 N e^{-i Phi}`` for every ``(omega[k], dirs[d])`` pair.
 
     Parameters
@@ -503,6 +546,17 @@ def double_time_integral_batch(time, position, beta, omega, dirs, epsilon, mass=
         ``epsilon_prime`` are no longer used.  Every value must be positive
         and, for the recoil phase, above every ``omega[k]``.  On the mass
         shell ``eps(t) = mass * gamma(t)``.
+    checks : ``"warn"`` (default), ``"raise"`` or ``"ignore"``
+        Adequacy guards on the result.  ``"warn"`` emits
+        :class:`SamplingWarning` when the time grid under-resolves the
+        double-time phase -- the trapezoid sum is then aliased and the value
+        is a sampling artifact, arbitrarily large and of either sign, not a
+        spectrum -- and :class:`RecordLengthWarning` when the record is short
+        compared with the formation time, where the integral is
+        endpoint-dominated and under-reports.  ``"raise"`` turns either into
+        an exception; ``"ignore"`` silences both.  Use
+        :func:`sampling_margin` / :func:`record_adequacy` (or
+        :meth:`BKIntegrator.adequacy`) to inspect the margins directly.
 
     Returns
     -------
@@ -523,6 +577,9 @@ def double_time_integral_batch(time, position, beta, omega, dirs, epsilon, mass=
     if energy is not None:
         energy = _check_local_energy(energy, time.shape[0], kernel, epsilon_prime)
         A, B, f = _local_vertex_arrays(kernel, omega, energy, phase, mass)
+        _run_adequacy_checks(time, beta, dirs, omega,
+                             f.max(axis=1) if f.ndim > 1 else f,
+                             epsilon, epsilon_prime, phase, energy, checks)
         if backend == "numpy":
             out = np.empty((omega.shape[0], dirs.shape[0]))
             for k in range(omega.shape[0]):
@@ -546,6 +603,8 @@ def double_time_integral_batch(time, position, beta, omega, dirs, epsilon, mass=
 
     eps_p = _final_energy(omega, epsilon, epsilon_prime)
     fac = _phase_factor(phase, omega, epsilon, eps_p)
+    _run_adequacy_checks(time, beta, dirs, omega, fac, epsilon, epsilon_prime,
+                         phase, None, checks)
 
     if backend == "numpy":
         out = np.empty((omega.shape[0], dirs.shape[0]))
@@ -573,7 +632,7 @@ def double_time_integral_batch(time, position, beta, omega, dirs, epsilon, mass=
 
 def double_time_integral(time, position, beta, omega, n, epsilon, mass=1.0,
                          kernel="dot", epsilon_prime=None, phase="recoil",
-                         chunk=256, backend="auto", energy=None):
+                         chunk=256, backend="auto", energy=None, checks="warn"):
     """Return ``I = int dt1 dt2 N(t1,t2) exp(-i Phi(t1,t2))`` (complex) for
     one ``(omega, n)``.
 
@@ -595,6 +654,10 @@ def double_time_integral(time, position, beta, omega, n, epsilon, mass=1.0,
         energy = _check_local_energy(energy, time_arr.shape[0], kernel, epsilon_prime)
         A, B, f = _local_vertex_arrays(kernel, np.array([omega]), energy, phase, mass)
         if backend == "numpy":
+            _run_adequacy_checks(time_arr, np.asarray(beta, dtype=np.float64),
+                                 np.atleast_2d(np.asarray(n, dtype=np.float64)),
+                                 np.array([omega]), f.max(axis=1), epsilon,
+                                 epsilon_prime, phase, energy, checks)
             position = np.asarray(position, dtype=np.float64)
             beta = np.asarray(beta, dtype=np.float64)
             n = np.asarray(n, dtype=np.float64)
@@ -602,41 +665,46 @@ def double_time_integral(time, position, beta, omega, n, epsilon, mass=1.0,
                                            A[0], B[0], f[0], chunk)
         out = double_time_integral_batch(time, position, beta, [omega], [n], epsilon,
                                          mass=mass, kernel=kernel, phase=phase,
-                                         backend="numba", energy=energy)
+                                         backend="numba", energy=energy, checks=checks)
         return complex(out[0, 0], 0.0)
 
     eps_p = float(np.asarray(_final_energy(omega, epsilon, epsilon_prime)))
     factor = float(np.asarray(_phase_factor(phase, omega, epsilon, eps_p)))
 
     if backend == "numpy":
-        time = np.asarray(time, dtype=np.float64)
+        time_arr = np.asarray(time, dtype=np.float64)
+        _run_adequacy_checks(time_arr, np.asarray(beta, dtype=np.float64),
+                             np.atleast_2d(np.asarray(n, dtype=np.float64)),
+                             np.array([omega]), np.array([factor]), epsilon,
+                             epsilon_prime, phase, None, checks)
         position = np.asarray(position, dtype=np.float64)
         beta = np.asarray(beta, dtype=np.float64)
         n = np.asarray(n, dtype=np.float64)
-        return _double_sum_numpy(time, position, beta, n, factor, kernel, epsilon,
+        return _double_sum_numpy(time_arr, position, beta, n, factor, kernel, epsilon,
                                  omega, eps_p, mass, chunk)
 
     out = double_time_integral_batch(time, position, beta, [omega], [n], epsilon,
                                      mass=mass, kernel=kernel, epsilon_prime=eps_p,
-                                     phase=phase, backend="numba")
+                                     phase=phase, backend="numba", checks=checks)
     return complex(out[0, 0], 0.0)
 
 
 def d2_energy(time, position, beta, omega, n, epsilon, mass=1.0, charge=1.0,
               kernel="dot", epsilon_prime=None, phase="recoil", chunk=256,
-              diagnostics=False, backend="auto", energy=None):
+              diagnostics=False, backend="auto", energy=None, checks="warn"):
     """Differential energy spectrum ``d2E/(dw dO)`` for one (omega, n).
 
     ``energy`` optionally switches to the local-energy (sec. 4.2) form, see
     :func:`double_time_integral_batch`.  With ``diagnostics=True`` returns
     ``(d2E, d2E_imag)`` where ``d2E_imag`` is the imaginary part scaled by
     the same prefactor (round-off level with the numpy backend, identically
-    zero with numba); the real part is the physical spectrum.
+    zero with numba); the real part is the physical spectrum.  ``checks``
+    selects the aliasing / record-length guards (``"warn"`` by default).
     """
     I = double_time_integral(time, position, beta, omega, n, epsilon,
                              mass=mass, kernel=kernel, epsilon_prime=epsilon_prime,
                              phase=phase, chunk=chunk, backend=backend,
-                             energy=energy)
+                             energy=energy, checks=checks)
     pref = PREFACTOR * omega ** 2 * charge ** 2
     d2E = pref * I.real
     if diagnostics:
@@ -646,7 +714,7 @@ def d2_energy(time, position, beta, omega, n, epsilon, mass=1.0, charge=1.0,
 
 def d2_probability(time, position, beta, omega, n, epsilon, mass=1.0, charge=1.0,
                    kernel="dot", epsilon_prime=None, phase="recoil", chunk=256,
-                   diagnostics=False, backend="auto", energy=None):
+                   diagnostics=False, backend="auto", energy=None, checks="warn"):
     """Differential probability ``d2W/(dw dO)`` for one (omega, n).
 
     With ``diagnostics=True`` returns ``(d2W, d2W_imag)`` (see
@@ -657,12 +725,12 @@ def d2_probability(time, position, beta, omega, n, epsilon, mass=1.0, charge=1.0
                                    mass=mass, charge=charge, kernel=kernel,
                                    epsilon_prime=epsilon_prime, phase=phase,
                                    chunk=chunk, diagnostics=True, backend=backend,
-                                   energy=energy)
+                                   energy=energy, checks=checks)
         return d2E / omega, d2E_imag / omega
     return d2_energy(time, position, beta, omega, n, epsilon, mass=mass,
                      charge=charge, kernel=kernel, epsilon_prime=epsilon_prime,
                      phase=phase, chunk=chunk, backend=backend,
-                     energy=energy) / omega
+                     energy=energy, checks=checks) / omega
 
 
 def classical_d2_energy(time, position, beta, omega, n, charge=1.0):
@@ -675,21 +743,46 @@ def classical_d2_energy(time, position, beta, omega, n, charge=1.0):
     return PREFACTOR * omega ** 2 * charge ** 2 * np.sum(np.abs(A) ** 2)
 
 
-def cone_directions(axis, theta_max, n_theta, n_phi):
+def cone_directions(axis, theta_max, n_theta, n_phi, split=None, n_inner=None):
     """Directions and solid-angle weights on a cone around ``axis``.
 
     ``cos(theta)`` is sampled with Gauss--Legendre over ``[cos(theta_max), 1]``
     and ``phi`` uniformly over ``[0, 2 pi)``.  Returns ``(dirs, dOmega)`` with
     ``dirs`` of shape ``(n_theta * n_phi, 3)`` and ``dOmega`` the per-sample
     solid angle (summing to the full cone solid angle ``2 pi (1 - cos(theta_max))``).
+
+    ``split`` (radians), together with ``n_inner``, enables a **two-panel**
+    rule: Gauss--Legendre on ``[0, split]`` with ``n_inner`` nodes plus
+    ``[split, theta_max]`` with ``n_theta``.  A single wide panel puts its
+    nodes where ``cos(theta)`` is smooth, not where the emission is.  Measured
+    on a ``gamma = 10``, ``chi = 0.5`` circle at integer recoil-shifted
+    harmonics, against a converged reference: a *single* panel spanning
+    ``[0, pi]`` with ``n_theta = 16`` under-reports the angle-integrated
+    ``dE/domega`` by 20% at ``delta = 0.3`` and by 97% at ``delta = 0.5``, and
+    needs ``n_theta ~ 64`` to converge; splitting the ``1/gamma`` core off with
+    ``split = 8/gamma`` and ``n_inner ~ 24`` reproduces the converged value to
+    the printed digits.  Directions are ordered inner panel first, then outer,
+    each grouped by ``theta`` with the ``n_phi`` azimuths innermost.
     """
     axis = np.asarray(axis, dtype=np.float64)
     axis = axis / np.linalg.norm(axis)
 
-    x, wx = roots_legendre(n_theta)             # x in (-1, 1)
-    cos_min = np.cos(theta_max)
-    cos_theta = 0.5 * (1.0 - cos_min) * x + 0.5 * (1.0 + cos_min)
-    dcos = 0.5 * (1.0 - cos_min) * wx           # d(cos theta) weight
+    if split is None or n_inner is None or not 0.0 < split < theta_max:
+        bands = [(theta_max, n_theta)]
+    else:
+        bands = [(split, n_inner), (theta_max, n_theta)]
+
+    cos_theta = []
+    dcos = []
+    upper = 1.0
+    for bound, n in bands:
+        lower = np.cos(bound)
+        x, wx = roots_legendre(n)               # x in (-1, 1)
+        cos_theta.append(0.5 * (upper - lower) * x + 0.5 * (upper + lower))
+        dcos.append(0.5 * (upper - lower) * wx)  # d(cos theta) weight
+        upper = lower
+    cos_theta = np.concatenate(cos_theta)
+    dcos = np.concatenate(dcos)
     theta = np.arccos(np.clip(cos_theta, -1.0, 1.0))
 
     phi = np.linspace(0.0, 2.0 * np.pi, n_phi, endpoint=False)
@@ -714,6 +807,322 @@ def cone_directions(axis, theta_max, n_theta, n_phi):
     return np.asarray(dirs), np.asarray(dom)
 
 
+# --------------------------------------------------------------------------
+# adequacy diagnostics: trapezoid aliasing and record-length truncation
+# --------------------------------------------------------------------------
+class SamplingWarning(UserWarning):
+    """The time grid under-resolves the double-time phase (trapezoid aliasing).
+
+    Raised when ``dt * max|dPhi/dt| >= pi``.  The double sum is then a
+    sampling artifact -- it can be arbitrarily large and of either sign -- and
+    not physics.  Remedy: refine ``time`` (or evaluate at smaller ``omega``).
+    """
+
+
+class RecordLengthWarning(UserWarning):
+    """The record is short compared with the formation time (truncation deficit).
+
+    Raised when ``L < 1.5 tau_f(omega)``.  The double integral is then
+    dominated by the hard record endpoints rather than by the bulk, so the
+    spectrum is under-reported and can even go negative.  Remedy: record
+    longer, or evaluate at larger ``omega`` (``tau_f`` grows towards lower
+    ``omega``).
+    """
+
+
+class AngularConvergenceWarning(UserWarning):
+    """The direction grid under-resolves the angular integral.
+
+    Raised by :meth:`BKIntegrator.compute_spectrum` when doubling
+    ``n_theta``/``n_phi`` (and the inner-panel node count) moves the
+    angle-integrated ``dE/domega`` by more than ``rtol`` **of its own peak** at
+    the frequencies carrying the most spectrum.  The quoted spectrum is then a
+    quadrature artifact of the grid, not a converged angular integral.  Remedy:
+    raise ``n_theta``/``n_phi``, or pass an explicit ``theta_max``/``n_inner``
+    matched to the emission cone.
+
+    Both the probe choice and the peak reference exist because a spectral
+    density has nulls: between the harmonics of a structured orbit the value is
+    a cancellation residual, where a pointwise relative change is meaningless
+    (measured to exceed 100% on a closed orbit while the line centres move by
+    ``1e-5``).
+    """
+
+
+def _max_phase_rate(beta, dirs):
+    """``max_{sample, direction} |1 - n.v|`` -- the phase-rate shape factor.
+
+    ``dPhi/dt2 = f (omega) [1 - n.v(t2)]``, so the fastest rate realised by
+    the supplied directions and samples is this factor times ``f``.
+    """
+    nb = np.asarray(beta, dtype=np.float64) @ np.asarray(dirs, dtype=np.float64).T
+    return float(np.max(np.abs(1.0 - nb)))
+
+
+def _curvature_rate(time, beta):
+    """Median ``|dv/dt|`` over the record (the velocity-rotation rate).
+
+    Equals ``chi/gamma^2`` for uniform circular motion.  ``0`` for a straight
+    record, for which the formation-time diagnostic does not apply (there the
+    kernel's vacuum subtraction already removes the straight-line part).
+    """
+    time = np.asarray(time, dtype=np.float64)
+    beta = np.asarray(beta, dtype=np.float64)
+    if time.shape[0] < 3:
+        return 0.0
+    dv = np.linalg.norm(np.diff(beta, axis=0), axis=1) / np.diff(time)
+    return float(np.median(dv))
+
+
+def velocity_swing(beta):
+    """Largest angle (radians) between ``beta(t)`` and ``beta[0]``.
+
+    The spectrum is angle-integrated over a cone about a *fixed* axis (the
+    initial velocity by default), but each part of the record radiates about
+    the *instantaneous* velocity.  Emitted directions therefore reach out to
+    ``velocity_swing + theta_c``, so a record that turns by more than
+    ``theta_max`` is truncated no matter how fine the cone is.  A closed orbit
+    swings by ``2 pi`` -- which is why every closed-orbit validation passes
+    ``theta_max = pi`` explicitly.
+    """
+    beta = np.asarray(beta, dtype=np.float64)
+    if beta.shape[0] < 2:
+        return 0.0
+    norms = np.linalg.norm(beta, axis=1)
+    if norms[0] <= 0.0:
+        return 0.0
+    cosang = (beta @ beta[0]) / (norms * norms[0])
+    return float(np.arccos(np.clip(np.min(cosang), -1.0, 1.0)))
+
+
+def emission_half_angle(omega, epsilon, epsilon_prime, curvature_rate):
+    """Stationary-phase emission half-angle ``theta_c`` per ``omega`` (radians).
+
+    ``theta_c = (4 eps' Omega_eff / (omega eps))**(1/3)`` -- equivalently
+    ``(4/m)**(1/3)`` with ``m = omega eps / (eps' Omega_eff)`` the
+    recoil-shifted harmonic index.  It is the angle at which the cubic
+    curvature term of the accumulated phase, ``Omega_eff**2 tau**3/6``,
+    overtakes the angular term ``(1/gamma**2 + theta**2)``, i.e. where emission
+    from one formation length starts to dephase.
+
+    Measured on a ``gamma = 10``, ``chi = 0.5`` circle at *integer*
+    recoil-shifted harmonics (BK kernel, converged 128-node rule), the
+    half-energy emission angle is ``0.35 theta_c`` (``theta_50 gamma m**(1/3)
+    = 4.6 ... 6.2`` over ``delta = 0.02 ... 0.7``).  ``theta_c`` therefore
+    *narrows* towards high ``omega`` -- ``4.6/gamma`` at ``delta = 0.02`` down
+    to ``0.95/gamma`` at ``delta = 0.7``; the soft-photon cone is the wide one.
+    (The roadmap's P-4 originally claimed the opposite direction.)  Returns
+    zeros where ``Omega_eff = 0``: a straight record radiates nothing.
+    """
+    omega = np.atleast_1d(np.asarray(omega, dtype=np.float64))
+    if curvature_rate <= 0.0:
+        return np.zeros(omega.shape)
+    return (
+        4.0 * np.asarray(epsilon_prime, dtype=np.float64) * curvature_rate
+        / (omega * epsilon)
+    ) ** (1.0 / 3.0)
+
+
+def default_theta_max(time, beta, omega, epsilon, epsilon_prime=None,
+                      safety=3.0, floor=None):
+    """Adaptive cone half-angle covering the whole emission band.
+
+    ``min(pi, velocity_swing + safety * max_omega theta_c(omega))``, floored at
+    ``floor`` so the default is never tighter than the historical fixed
+    ``5/gamma``.  The maximum over the ``omega`` grid is taken because one
+    direction grid is shared by every frequency (the numba batch path sums all
+    ``(omega, n)`` pairs in a single pass), so the widest cone in the grid has
+    to cover the rest.
+
+    Both terms are needed: ``theta_c`` grows towards low ``omega``, while the
+    velocity swing grows with the record length -- and at low ``omega`` the
+    record must be at least ``~1.5`` formation times long (see
+    :func:`record_adequacy`), long enough on a curved orbit to swing far from
+    the initial direction.
+    """
+    omega = np.atleast_1d(np.asarray(omega, dtype=np.float64))
+    eps_p = _final_energy(omega, epsilon, epsilon_prime)
+    theta_c = emission_half_angle(omega, epsilon, eps_p,
+                                  _curvature_rate(time, beta))
+    value = velocity_swing(beta) + safety * float(np.max(theta_c))
+    if floor is not None:
+        value = max(value, float(floor))
+    return min(np.pi, value)
+
+
+def angular_edge_fraction(d2E, dom, n_phi):
+    """Fraction of the angular integral carried by the outermost ``theta`` node.
+
+    Free diagnostic (no recompute).  With :func:`cone_directions` ordering the
+    directions inner panel first, then outer, the last ``n_phi`` samples are the
+    node nearest ``theta_max``.  A large value means the spectrum is fed by
+    emission at the edge of the cone -- i.e. the cone is close to truncating and
+    ``theta_max`` should be raised.
+    """
+    d2E = np.atleast_2d(np.asarray(d2E, dtype=np.float64))
+    dom = np.asarray(dom, dtype=np.float64)
+    edge = np.sum(d2E[:, -n_phi:] * dom[-n_phi:], axis=1)
+    total = d2E @ dom
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(total != 0.0, edge / total, 0.0)
+
+
+#: Angular-convergence guard threshold: a change of the angle-integrated
+#: ``dE/domega`` above this fraction of its peak, on grid refinement, is a
+#: warning.  Peak-referenced rather than pointwise -- see
+#: :class:`AngularConvergenceWarning`.
+ANGULAR_RTOL = 0.02
+
+
+def sampling_margin(time, beta, dirs, omega, factor):
+    """Per-``omega`` trapezoid-aliasing margin ``dt * f * max|1 - n.v| / pi``.
+
+    The double-time phase ``Phi = f [(t2-t1) - n.(r2-r1)]`` with
+    ``f = omega eps/eps'`` oscillates at up to ``f * max|1 - n.v|``; the
+    trapezoid sum resolves it only if that rate times the step is below the
+    Nyquist limit ``pi`` (two samples per oscillation).  **A margin ``>= 1``
+    means the double sum is aliased**: the returned value is then a sampling
+    artifact, arbitrarily large and of either sign, not a spectrum.
+
+    On a circle of period ``T`` the margin is ``4m/Nt`` with ``m`` the
+    recoil-shifted harmonic index, i.e. it requires ``Nt > 4m`` -- twice the
+    ``Nt > 2m`` quoted in :func:`validation.check_quantum_synchrotron`, which
+    permits only one sample per oscillation and is measurably too lax (at
+    ``m = 1990``, ``Nt = 2m`` still errs by 116%, ``Nt = 4m`` by 0.07%).
+
+    Parameters
+    ----------
+    time : (Nt,) array; the largest step of the (possibly non-uniform) grid is used.
+    beta : (Nt, 3) velocities.
+    dirs : (Ndir, 3) unit vectors.
+    omega : (N_omega,) array.
+    factor : (N_omega,) phase factor ``f`` (``omega eps/eps'`` or ``omega``).
+
+    Returns
+    -------
+    (N_omega,) array of margins; values ``>= 1`` are aliased.
+    """
+    time = np.asarray(time, dtype=np.float64)
+    dt = float(np.max(np.diff(time))) if time.shape[0] > 1 else 0.0
+    shape = _max_phase_rate(beta, dirs)
+    return dt * np.asarray(factor, dtype=np.float64) * shape / np.pi
+
+
+def formation_time(time, beta, omega, epsilon, epsilon_prime=None):
+    """Curvature-limited formation (coherence) time ``tau_f`` per ``omega``.
+
+    ``tau_f = (6 eps' / (omega Omega_eff^2))**(1/3)`` -- the time for the
+    curvature term of the accumulated phase, ``(omega/2eps') Omega_eff^2
+    tau^3/3``, to reach unity (``Omega_eff`` = median ``|dv/dt|``, equal to
+    ``chi/gamma^2`` on a circle).  Returns ``inf`` for a straight record,
+    where the diagnostic does not apply.
+
+    This is the coherence scale of the double-time integral: pairs with
+    ``|t2 - t1| >> tau_f`` oscillate and cancel, so the spectrum is carried by
+    the band ``|t2 - t1| <~ tau_f``.  It grows towards low ``omega``
+    (``~ omega^{-1/3}``), which is why the soft-photon region is the first to
+    suffer when the record is short.
+    """
+    time = np.asarray(time, dtype=np.float64)
+    omega = np.atleast_1d(np.asarray(omega, dtype=np.float64))
+    eps_p = epsilon - omega if epsilon_prime is None else np.asarray(epsilon_prime, dtype=np.float64)
+    rate = _curvature_rate(time, beta)
+    if rate <= 0.0:
+        return np.full(omega.shape, np.inf)
+    return (6.0 * eps_p / (omega * rate ** 2)) ** (1.0 / 3.0)
+
+
+def record_adequacy(time, beta, omega, epsilon, epsilon_prime=None):
+    """Record length in formation times, ``L / tau_f(omega)``, per ``omega``.
+
+    The double integral is bulk-dominated only for ``L >> tau_f``; at
+    ``L <~ tau_f`` the hard record endpoints dominate and the spectrum is
+    under-reported -- it can even go negative.  Measured on arcs of a
+    ``gamma = 10``, ``chi = 0.5`` circle at the first harmonic, against
+    ``L * dP/domega``:
+
+    ==========  =========  =======
+    ``L/tau_f``  deficit     note
+    ==========  =========  =======
+    1.60         0%         closed orbit (periodic -- exact; the guard's
+                            ``1.5`` threshold deliberately leaves it alone)
+    1.44        11%
+    1.28        28%
+    1.12        52%
+    0.96        79%
+    0.80        collapse   sign flips ($-0.03$)
+    0.64        collapse   ($-0.19$)
+    ==========  =========  =======
+
+    So treat ``L/tau_f <~ 3`` as "quoted spectrum is a lower bound" and
+    ``<~ 1.5`` as "not trustworthy".  :func:`formation_time` documents
+    ``tau_f``; a straight record returns ``inf`` (the diagnostic does not
+    apply -- there the kernel's vacuum subtraction removes the straight-line
+    part and no truncation deficit arises).
+    """
+    time = np.asarray(time, dtype=np.float64)
+    span = float(time[-1] - time[0]) if time.shape[0] > 1 else 0.0
+    tau_f = np.atleast_1d(formation_time(time, beta, omega, epsilon, epsilon_prime))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        # a straight record has tau_f = inf -> the check does not apply (inf,
+        # not 0: 0 would read as "maximally inadequate")
+        return np.where(np.isinf(tau_f), np.inf, span / tau_f)
+
+
+def _run_adequacy_checks(time, beta, dirs, omega, factor, epsilon, epsilon_prime,
+                         phase, energy, checks):
+    """Emit :class:`SamplingWarning` / :class:`RecordLengthWarning` as requested.
+
+    ``checks`` is ``"warn"`` (default), ``"raise"`` or ``"ignore"``.  The two
+    checks are independent: aliasing is a property of the time grid, the
+    record-length deficit of the span versus the formation time.
+    """
+    if checks == "ignore":
+        return
+    if checks not in ("warn", "raise"):
+        raise ValueError("checks must be 'warn', 'raise' or 'ignore'")
+
+    def emit(message, category):
+        if checks == "raise":
+            raise category(message)
+        warnings.warn(message, category)
+
+    omega = np.atleast_1d(np.asarray(omega, dtype=np.float64))
+    margin = sampling_margin(time, beta, dirs, omega, factor)
+    if np.any(margin >= 1.0):
+        dt = float(np.max(np.diff(np.asarray(time, dtype=np.float64))))
+        k = int(np.argmax(margin))
+        emit(
+            "double-time phase is under-resolved (trapezoid aliasing): "
+            f"{int(np.sum(margin >= 1.0))}/{omega.size} omega values have "
+            f"dt*max|dPhi/dt|/pi >= 1 (max margin {margin.max():.3g} at "
+            f"omega = {omega[k]:.6g}, dt = {dt:.6g}). Those values are sampling "
+            "artifacts -- arbitrarily large and of either sign -- not a spectrum. "
+            f"Refine the time grid by ~{np.ceil(2.0 * margin.max()):.0f}x "
+            "(Nyquist needs two samples per phase oscillation) or use smaller omega.",
+            SamplingWarning,
+        )
+
+    if energy is not None:
+        eps_ref = float(np.mean(np.asarray(energy, dtype=np.float64)))
+        eps_prime_ref = (eps_ref - omega) if phase == "recoil" else eps_ref
+    else:
+        eps_ref = float(epsilon)
+        eps_prime_ref = (eps_ref - omega) if epsilon_prime is None else epsilon_prime
+    adequacy = record_adequacy(time, beta, omega, eps_ref, eps_prime_ref)
+    if np.any(adequacy < 1.5):
+        k = int(np.argmin(adequacy))
+        emit(
+            "record is short compared with the formation time: "
+            f"L/tau_f < 1.5 for {int(np.sum(adequacy < 1.5))}/{omega.size} omega "
+            f"values (min L/tau_f = {adequacy.min():.3g} at omega = {omega[k]:.6g}). "
+            "The double integral is then dominated by the hard record endpoints "
+            "and under-reports the spectrum (it can go negative). Record longer, "
+            "or evaluate at larger omega.",
+            RecordLengthWarning,
+        )
+
+
 def _recoil_args(params):
     """Map ``Parameters.recoil`` onto the integrator's ``(phase, epsilon_prime)``.
 
@@ -734,13 +1143,20 @@ class BKIntegrator:
     evaluated with the sec. 4.2 local-energy generalization
     (``eps(t1), eps(t2)`` with per-vertex recoil); otherwise the fixed
     incident energy ``Parameters.epsilon`` is used.
+
+    ``checks`` selects the adequacy guards: ``"warn"`` (default) emits
+    :class:`SamplingWarning` when the time grid under-resolves the phase
+    (trapezoid aliasing) and :class:`RecordLengthWarning` when the record is
+    short compared with the formation time; ``"raise"`` turns either into an
+    exception and ``"ignore"`` disables both.
     """
 
     def __init__(self, trajectory: Trajectory, params: Parameters,
-                 backend: str = "auto") -> None:
+                 backend: str = "auto", checks: str = "warn") -> None:
         self.trajectory = trajectory
         self.params = params
         self.backend = _resolve_backend(backend)
+        self.checks = checks
         self.time = trajectory.time
         self.position = trajectory.position
         self.beta = trajectory.beta()
@@ -757,7 +1173,7 @@ class BKIntegrator:
             self.time, self.position, self.beta, omega_grid, dirs,
             self.params.epsilon, mass=self.params.mass, kernel=self.params.kernel,
             epsilon_prime=eps_p, phase=phase, backend=self.backend,
-            energy=self.energy,
+            energy=self.energy, checks=self.checks,
         )
         return PREFACTOR * omega_grid[:, None] ** 2 * self.params.charge ** 2 * I
 
@@ -773,13 +1189,100 @@ class BKIntegrator:
     def d2_probability(self, omega, n):
         return self.d2_energy(omega, n) / omega
 
+    # -- adequacy diagnostics ----------------------------------------------
+    def adequacy(self, omega_grid, dirs):
+        """Per-``omega`` ``(sampling_margin, L/tau_f)`` for these directions.
+
+        ``sampling_margin >= 1``: the time grid under-resolves the double-time
+        phase and the double sum is a trapezoid-aliasing artifact (arbitrarily
+        large, either sign) rather than a spectrum.  ``L/tau_f <~ 1``: the
+        record is shorter than the formation time, so the integral is
+        endpoint-dominated and under-reports (it can go negative).  See
+        :func:`sampling_margin` and :func:`record_adequacy` for the definitions
+        and for the measured size of each failure.
+        """
+        omega_grid = np.atleast_1d(np.asarray(omega_grid, dtype=np.float64))
+        dirs = np.atleast_2d(np.asarray(dirs, dtype=np.float64))
+        phase, eps_p = _recoil_args(self.params)
+        if self.energy is not None:
+            _, _, f = _local_vertex_arrays(self.params.kernel, omega_grid,
+                                           self.energy, phase, self.params.mass)
+            factor = f.max(axis=1)
+            eps_ref = float(np.mean(self.energy))
+            eps_prime_ref = (eps_ref - omega_grid) if phase == "recoil" else eps_ref
+        else:
+            eps_prime_ref = _final_energy(omega_grid, self.params.epsilon, eps_p)
+            factor = _phase_factor(phase, omega_grid, self.params.epsilon, eps_prime_ref)
+            eps_ref = self.params.epsilon
+        return (sampling_margin(self.time, self.beta, dirs, omega_grid, factor),
+                record_adequacy(self.time, self.beta, omega_grid, eps_ref, eps_prime_ref))
+
     # -- spectrum ----------------------------------------------------------
+    def _angular_convergence(self, omega_grid, dE, axis, theta_max, n_theta,
+                             n_phi, split, n_inner, n_probe=3):
+        """Refine the direction grid at a few ``omega`` and compare.
+
+        Returns ``(max_change, probe_omega)``.  The probes are the ``n_probe``
+        frequencies carrying the most spectrum (largest ``|dE/domega|``) --
+        that is where a quadrature error would corrupt the answer -- and the
+        change is measured against the **peak** of the probed spectrum, not
+        point by point.  ``n_theta``, ``n_phi`` and the inner-panel count are all
+        doubled, so the cost is about ``4 n_probe / N_omega`` of the base
+        angular integral.
+
+        Both choices exist for the same reason: a spectral density has nulls.
+        Between the harmonics of a closed orbit the value is a cancellation
+        residual which is *measured* to swing by more than its own size under
+        grid refinement, while the line centres are stable to ``1e-5``.  A
+        guard that probed those nulls pointwise would fire on every structured
+        spectrum while saying nothing about the lines.  Weighted probes with a
+        peak reference instead bound the error on the spectrum as a whole, which
+        is what the quadrature actually controls.
+        """
+        n = omega_grid.size
+        if n == 0:
+            return 0.0, np.array([])
+        order = np.argsort(np.abs(dE))
+        probe = np.sort(order[::-1][:max(2, min(n_probe, n))])
+        dirs, dom = cone_directions(
+            axis, theta_max, 2 * n_theta, 2 * n_phi, split=split,
+            n_inner=None if n_inner is None else 2 * n_inner,
+        )
+        refined = self.d2_energy_batch(omega_grid[probe], dirs) @ dom
+        base = dE[probe]
+        scale = float(np.max(np.abs(base)))
+        if scale <= 0.0:
+            return 0.0, omega_grid[probe]
+        return float(np.max(np.abs(refined - base)) / scale), omega_grid[probe]
+
     def compute_spectrum(self, omega_grid, theta_max=None, n_theta=16, n_phi=8,
-                         axis=None) -> Spectrum:
+                         axis=None, split=None, n_inner=None) -> Spectrum:
         """Angle-integrate ``dW/dw`` and ``dE/dw`` over a cone of directions.
 
-        The cone axis defaults to the initial velocity direction (beam axis);
-        ``theta_max`` defaults to ``5 / gamma``.
+        The cone axis defaults to the initial velocity direction (beam axis).
+
+        ``theta_max=None`` (the default) adapts the cone to the record through
+        :func:`default_theta_max`, ``velocity_swing + 3 max_omega theta_c``
+        capped at ``pi`` and floored at the historical fixed ``5 / gamma``.  The
+        fixed cone was wrong at both ends: ``theta_c`` reaches ``4.6 / gamma`` at
+        ``delta = 0.02`` (so the soft-photon end, the region this module exists
+        to get right, was truncated by ~7%) while at high ``delta`` the cone is
+        actually narrower than ``5 / gamma``; and it ignored the velocity swing
+        over the record entirely, which for a closed orbit is ``2 pi`` -- for
+        which the fixed cone captures about 1%.  An explicit ``theta_max`` is
+        honoured (clamped to ``pi``).
+
+        ``split``/``n_inner`` select the two-panel direction rule of
+        :func:`cone_directions`.  When ``theta_max`` is auto they default to
+        ``min(8/gamma, theta_max/2)`` and ``n_theta``; an explicit ``theta_max``
+        keeps the historical single-panel rule unless ``split`` is passed, so
+        existing callers are numerically unchanged.
+
+        The angular diagnostics go into ``metadata``
+        (``angular_edge_fraction`` -- free; ``angular_convergence`` and
+        ``angular_probe_omega`` -- from the refinement check) and the refinement
+        check raises :class:`AngularConvergenceWarning` under
+        ``checks="warn"`` (the default), with ``"raise"``/``"ignore"`` available.
         """
         omega_grid = np.atleast_1d(np.asarray(omega_grid, dtype=np.float64))
         if axis is None:
@@ -788,15 +1291,65 @@ class BKIntegrator:
                 axis = np.array([0.0, 0.0, 1.0])
             else:
                 axis = beta0 / np.linalg.norm(beta0)
-        if theta_max is None:
-            gamma0 = float(self.trajectory.gamma()[0])
-            theta_max = 5.0 / max(gamma0, 1e-6)
+        gamma0 = float(self.trajectory.gamma()[0])
+        floor = 5.0 / max(gamma0, 1e-6)
 
-        dirs, dom = cone_directions(axis, theta_max, n_theta, n_phi)
+        phase, eps_p = _recoil_args(self.params)
+        if self.energy is not None:
+            eps_ref = float(np.mean(self.energy))
+            eps_prime_ref = ((eps_ref - omega_grid) if phase == "recoil"
+                             else np.full_like(omega_grid, eps_ref))
+        else:
+            eps_ref = float(self.params.epsilon)
+            eps_prime_ref = _final_energy(omega_grid, eps_ref, eps_p)
+
+        auto = theta_max is None
+        swing = velocity_swing(self.beta)
+        if auto:
+            theta_max = default_theta_max(self.time, self.beta, omega_grid,
+                                          eps_ref, eps_prime_ref, safety=3.0,
+                                          floor=floor)
+        theta_max = float(min(np.pi, max(float(theta_max), 0.0)))
+
+        if split is None and auto:
+            split = min(8.0 / max(gamma0, 1e-6), 0.5 * theta_max)
+        if split is not None and n_inner is None:
+            n_inner = int(n_theta)
+
+        dirs, dom = cone_directions(axis, theta_max, n_theta, n_phi,
+                                    split=split, n_inner=n_inner)
 
         d2E = self.d2_energy_batch(omega_grid, dirs)   # (N_omega, N_dir)
         dE = d2E @ dom
         dW = dE / omega_grid
+
+        sampling, adequacy = self.adequacy(omega_grid, dirs)
+        edge = angular_edge_fraction(d2E, dom, n_phi)
+        if self.checks == "ignore":
+            convergence, probe_omega = float("nan"), np.array([])
+        else:
+            convergence, probe_omega = self._angular_convergence(
+                omega_grid, dE, axis, theta_max, n_theta, n_phi, split, n_inner)
+            if convergence > ANGULAR_RTOL:
+                message = (
+                    "direction grid under-resolves the angular integral: "
+                    "doubling n_theta/n_phi moves the angle-integrated "
+                    f"spectrum by up to {convergence * 100:.2f}% of its peak "
+                    f"(> {ANGULAR_RTOL * 100:.0f}%) at the probed "
+                    f"omega = {probe_omega.tolist()}. The quoted spectrum is a "
+                    "quadrature artifact of the grid. Raise n_theta/n_phi, or "
+                    "pass an explicit theta_max/n_inner matched to the emission "
+                    "cone (see integrator.emission_half_angle)."
+                    + ("" if swing < 0.25 * theta_max else
+                       f" The record turns by {swing:.3f} rad "
+                       f"({swing * gamma0:.2f}/gamma) against a cone of "
+                       f"{theta_max:.3f} rad, so the emission is NOT confined "
+                       "to a cone about axis=beta[0]: pass axis= (a symmetry "
+                       "or beam axis) or a converged n_theta over theta_max=pi.")
+                )
+                if self.checks == "raise":
+                    raise AngularConvergenceWarning(message)
+                warnings.warn(message, AngularConvergenceWarning)
 
         meta = dict(
             epsilon=self.params.epsilon,
@@ -810,18 +1363,41 @@ class BKIntegrator:
             n_samples=int(self.time.shape[0]),
             t_span=(float(self.time[0]), float(self.time[-1])),
             theta_max=float(theta_max),
+            theta_max_auto=bool(auto),
+            theta_split=None if split is None else float(split),
+            n_inner=None if n_inner is None else int(n_inner),
             n_theta=int(n_theta),
             n_phi=int(n_phi),
             backend=self.backend,
             units="natural (c=hbar=1, m_e=1)",
+            # adequacy guards: sampling >= 1 -> aliased, record_adequacy <~ 1 ->
+            # endpoint-dominated.  See integrator.sampling_margin /
+            # record_adequacy for definitions and measured failure sizes.
+            sampling_margin=sampling,
+            record_adequacy=adequacy,
+            # angular guards: edge -> fraction carried by the outermost node
+            # (free); convergence -> largest change under grid refinement,
+            # measured against the peak over angular_probe_omega (nan when
+            # checks="ignore").  The cone is only meaningful while the velocity
+            # swing stays well inside theta_max, so both the swing and the
+            # emission half-angle go in.
+            velocity_swing=float(swing),
+            emission_half_angle=emission_half_angle(omega_grid, eps_ref,
+                                                    eps_prime_ref,
+                                                    _curvature_rate(self.time, self.beta)),
+            angular_edge_fraction=edge,
+            angular_convergence=convergence,
+            angular_probe_omega=probe_omega,
         )
         return Spectrum(omega=omega_grid, dW_domega=dW, dE_domega=dE, metadata=meta)
 
 
 def compute_spectrum(trajectory: Trajectory, params: Parameters, omega_grid,
                      theta_max=None, n_theta=16, n_phi=8, axis=None,
-                     backend="auto") -> Spectrum:
+                     split=None, n_inner=None, backend="auto",
+                     checks="warn") -> Spectrum:
     """Convenience function: build an integrator and return the spectrum."""
-    return BKIntegrator(trajectory, params, backend=backend).compute_spectrum(
-        omega_grid, theta_max=theta_max, n_theta=n_theta, n_phi=n_phi, axis=axis
+    return BKIntegrator(trajectory, params, backend=backend, checks=checks).compute_spectrum(
+        omega_grid, theta_max=theta_max, n_theta=n_theta, n_phi=n_phi, axis=axis,
+        split=split, n_inner=n_inner,
     )
