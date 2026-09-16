@@ -27,11 +27,13 @@ from __future__ import annotations
 
 import numpy as np
 
+from . import units as _units
 from .types import Trajectory
 
 __all__ = [
     "Trajectory",
     "as_trajectory",
+    "as_trajectory_si",
     "uniform_trajectory",
     "linear_interpolate",
 ]
@@ -46,6 +48,66 @@ def as_trajectory(time, position, momentum=None, energy=None) -> Trajectory:
     """
     return Trajectory(time=time, position=position, momentum=momentum,
                       energy=energy)
+
+
+def as_trajectory_si(t_si, x_si, u=None, energy=None, n_samples=None) -> Trajectory:
+    """Build a :class:`Trajectory` from a PIC record (the SI unit adapter).
+
+    Parameters
+    ----------
+    t_si : (Nt,) array
+        Sample times in **seconds** (SI).  Produced by
+        :class:`~lambdapic.callback.trajectory.TrajectoryRecorder`.
+    x_si : (Nt, 3) array
+        Positions in **metres** (SI).
+    u : (Nt, 3) array, optional
+        Normalized momentum ``u = gamma beta``.  This is *passed through
+        unconverted*: it is already dimensionless and is the same quantity the
+        PIC stores as ``ux, uy, uz``, so ``units.si_to_natural``'s ``p_si``
+        entry (which takes kg m/s) is deliberately **not** used here.
+    energy : (Nt,) array, optional
+        Local electron energy ``eps(t_i)`` in **natural units** (for an
+        electron that is just ``gamma = 1/inv_gamma``).  Pass it whenever the
+        record's ``|u|`` is not constant: the integrator switches to the
+        local-energy phase **only** when ``Trajectory.energy`` is set, and
+        ``Trajectory.local_energy()`` — the on-shell ``gamma`` fallback — is
+        never consulted by the integrator.  Omitting it therefore evaluates an
+        accelerating record at a *fixed* incident energy, silently (measured on
+        a 5->15 ramp: a factor 4.5 error in ``dE/domega`` at ``omega=1``).
+    n_samples : int or array, optional
+        Length of the valid prefix.  The recorder writes fixed-shape
+        NaN-padded arrays so that a mid-record gap stays visible; slice to
+        ``n_samples`` here, because a NaN in ``time`` would otherwise be caught
+        by ``Trajectory.__post_init__`` and a NaN in ``position`` would make
+        every returned spectral value NaN.  A length-1 array is accepted (the
+        recorder stores it that way; ``int(np.array([n]))`` raises on NumPy >= 2).
+    """
+    t_si = np.asarray(t_si, dtype=np.float64)
+    x_si = np.asarray(x_si, dtype=np.float64)
+    if t_si.ndim != 1:
+        raise ValueError("t_si must be 1-D")
+    if x_si.shape != (t_si.shape[0], 3):
+        raise ValueError("x_si must have shape (Nt, 3)")
+    for name, arr in (("u", u), ("energy", energy)):
+        if arr is not None and np.asarray(arr).shape != ((t_si.shape[0], 3) if name == "u"
+                                                         else (t_si.shape[0],)):
+            raise ValueError(f"{name} has the wrong shape for this record")
+
+    if n_samples is not None:
+        n_arr = np.atleast_1d(np.asarray(n_samples))
+        if n_arr.size != 1:
+            raise ValueError("n_samples must be a scalar or a length-1 array")
+        n = int(n_arr[0])
+        if not 2 <= n <= t_si.shape[0]:
+            raise ValueError(
+                f"n_samples must satisfy 2 <= n_samples <= {t_si.shape[0]}, got {n}"
+            )
+        t_si, x_si = t_si[:n], x_si[:n]
+        u = None if u is None else np.asarray(u)[:n]
+        energy = None if energy is None else np.asarray(energy)[:n]
+
+    nat = _units.si_to_natural(t_si=t_si, x_si=x_si)
+    return as_trajectory(nat["t"], nat["x"], momentum=u, energy=energy)
 
 
 def uniform_trajectory(r_of_t, t0, t1, n_samples, **kwargs) -> Trajectory:

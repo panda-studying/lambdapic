@@ -1,6 +1,6 @@
 # Baier–Katkov 模块审查报告与 PIC 集成路线图
 
-> 审查日期：2026-09-07；更新：2026-09-08（§2 缺陷全部修复、前因子 4π 修正、Numba 后端、pytest 回归）、2026-09-11（P-1/P-2 收尾、P-3 重新诊断 + 适用性守卫、**P-4 自适应锥角 + 两板网格 + 角度守卫，原文方向判断被实测推翻**）、**2026-09-12（第二轮独立审查：基线全绿复核 + Test B 复现；新增 BUG-7/8/9 与一批输入校验、文档、验证债问题，全部本机复现，集中在 §2.5；其中代码级问题同日全部修复，回归 51→58 例）**、**2026-09-14（§8.2 带状截断判据实验：结论是"不做"——滞后分布不衰减、截断曲线小于整条记录都不收敛；§8.1 的"钥匙"说法作废，§5 P2 该项关闭）**。范围：[baier_katkov/](lambdapic/src/lambdapic/core/qed/baier_katkov/) 全部源码（约 1400 行）+ 主模拟 QED 管线（[radiation.py](lambdapic/src/lambdapic/core/qed/radiation.py)、[optical_depth.py](lambdapic/src/lambdapic/core/qed/optical_depth.py)、[inline.py](lambdapic/src/lambdapic/core/qed/inline.py)、[simulation.py](lambdapic/src/lambdapic/simulation/simulation.py)）。
+> 审查日期：2026-09-07；更新：2026-09-08（§2 缺陷全部修复、前因子 4π 修正、Numba 后端、pytest 回归）、2026-09-11（P-1/P-2 收尾、P-3 重新诊断 + 适用性守卫、**P-4 自适应锥角 + 两板网格 + 角度守卫，原文方向判断被实测推翻**）、**2026-09-12（第二轮独立审查：基线全绿复核 + Test B 复现；新增 BUG-7/8/9 与一批输入校验、文档、验证债问题，全部本机复现，集中在 §2.5；其中代码级问题同日全部修复，回归 51→58 例）**、**2026-09-14（§8.2 带状截断判据实验：结论是"不做"——滞后分布不衰减、截断曲线小于整条记录都不收敛；§8.1 的"钥匙"说法作废，§5 P2 该项关闭）**、**2026-09-15（§8.3 PIC 集成最小闭环：单位适配器 + 轨迹记录回调 + 静磁场测试台 + 带宽判据；更正 §8.2(b) 被作废的表）**。范围：[baier_katkov/](lambdapic/src/lambdapic/core/qed/baier_katkov/) 全部源码（约 1400 行）+ 主模拟 QED 管线（[radiation.py](lambdapic/src/lambdapic/core/qed/radiation.py)、[optical_depth.py](lambdapic/src/lambdapic/core/qed/optical_depth.py)、[inline.py](lambdapic/src/lambdapic/core/qed/inline.py)、[simulation.py](lambdapic/src/lambdapic/simulation/simulation.py)）。
 > 所有"已确认"的缺陷都在本机实际运行复现过：第一轮在 Windows 专机（venv，Python 3.11.9），**第二轮在 Linux 集群（`/home/panda/lambdapic/.venv`，Python 3.12.7，numpy 2.4.4）**。
 
 ---
@@ -476,6 +476,8 @@ $$M(d)=\sum_{i,j\in\text{一圈}}w_iw_j\,N\,e^{-i\Phi(t_i,\,t_j+dT)}$$
 
 $^*$ $n=1$ 的记录只跨 $1T$，$W\ge T$ 即全和。$n=4$ 时 $W=3T$ 已覆盖记录的 75%，截断和仍是全和的 **3.45 倍**，且 $C(W)$ 随 $W$ 上下乱跳（有符号部分和，非单调）。**被截掉的不是尾巴，是相消项**——闭合轨道上每个周期贡献完全相同，求和只靠整条记录上的相消才收敛。
 
+> ⚠️ **本表的数字已作废（2026-09-15）**：§8.3(a) 复核发现产出它的探针有分箱 bug（逐箱值与逐对枚举不符）。结论本身在更严格的实现与更真实的记录上更强地成立，但**具体数字不要引用**；用 `baier_katkov/banding.py` 重算。
+
 **(c) 朴素带破坏 $n^2$ 律，且不是"差一个系数"**。$\Gamma=$ 带和/$(n\cdot\text{LCFA})$ 在固定 $B$ 下**与 $n$ 无关**（$B=3$：1.72 / 1.64 / 1.60；$B=2$：5.22 / 5.57 / 5.75），即带和 $\propto n$、全和 $\propto n^2$。判据是"$\Gamma$ 变成 $n$-无关"，**不是 $\Gamma\to1$**——$B=3$、$n=1$ 时 $\Gamma=1.72$ 已经接近教科书式的 1，极易被误读为"收敛良好"。同时 $\Gamma$ 强烈依赖 $B$（$1.6$–$5.7$），说明结果由带宽任意决定。
 
 **(d) 梳状带 $|t_2-t_1-kT|\le B\tau_f$ 既不准也不省**。$k$ 取 $0\dots n-1$ 的窗口并集：`comb/full` $=3.06$（$B=1$）、$1.59$（$B=3$）、$2.45$（$B=5$）——**比全和还大**，随 $B$ 增大才降向 1（因为宽窗才把相消项放回来）。每行必须访问 $n$ 个窗口，保留的对数占比 16% / 47% / 79%（$B=1/3/5$），对全和的加速比是**常数** $T/(4B\tau_f)=3.12/B$——$B=3$ 时已无收益，$B=5$ 时**比全和还慢**。原写法只取 $k\ge0$、破坏厄米对称，需折到最近周期。
@@ -490,6 +492,70 @@ $^*$ $n=1$ 的记录只跨 $1T$，$W\ge T$ 即全和。$n=4$ 时 $W=3T$ 已覆�
 2. §8.1 的"钥匙"说法**作废**，§5 P2 的该项**关闭**。若将来仍要做 PIC 加速，必须先在一个**真正宽带、且长度 $\gg T$ 的**测试台上重新做 (b) 的截断曲线——那是本项重启的前置条件。
 3. $n$ 圈扫描的候选工具只剩**周期性分块**（$I_n=\sum_d(n-|d|)M(d)$，$O(n)$ 次单圈积分，连续时间下严格）。但 (f) 是新出现的前置障碍：单圈块和本身就是相消量，直算不稳；上网格还必须与 $T$ 可约（否则块相位差 $2\pi m/(N-1)$，$n=2$ 时 $1.43$ rad）。**在动这个工具之前，先解决块和的数值稳定性**。
 4. 方法学：本项目已连续三次出现"方向判断被实测推翻"（P-3、P-4、本节）。**凡涉及"某个近似可以丢"的判断，先做单变量截断曲线，再谈实现。**
+
+---
+
+## 8.3 PIC 集成最小闭环 + 真实轨迹上的带宽判据（2026-09-15）
+
+> 目标（用户选定"最小闭环"）：把**真实 PIC 轨迹**喂进 BK 模块的通路打通，并在它上面重做 §8.2 悬着的"非周期情形带宽是否可用"。
+
+**交付物**（4 个新文件 + 2 处小改）：
+
+| 文件 | 内容 |
+|---|---|
+| `trajectory.as_trajectory_si` | SI 适配器：$t,x$ 走 `units.si_to_natural`，$\mathbf u$ **直接透传**（PIC 的 `ux,uy,uz` 就是同一约定），不合成 energy（在壳回退到 $\gamma$ 是精确的） |
+| `callback/trajectory.py` `TrajectoryRecorder` | 挂在 **`start`** 而非路线图原写的 `_interpolator`；按全局 id 追踪；NaN 填充固定形状落盘 |
+| `baier_katkov/banding.py` | 判据工具：按物理滞后分箱、相消比、截断曲线（做成 `Trajectory` 上的函数） |
+| `example/bk-testbed.py` | 静磁场回旋测试台（可控 ∇B 漂移 = 退相干旋钮） |
+| `tests/test_trajectory_recorder.py` | 6 例（stage 注册、浮点 interval 拒绝、防双计守卫、落盘往返、id 稳定、pusher 快路径等价性） |
+
+**(a) §8.2(b) 的表是错的——旧探针有分箱 bug，该表作废。** 旧的 `/tmp` 实现给出的逐箱值与逐对枚举不符（第 0 箱给 $-0.0205$，而解析值 $4\pi\sum_i w_i^2 N_{ii}=-88.5$；新实现在同一输入上给 $-88.3$）。新的 `banding.lag_profile` 经两级验证：小算例上**逐对枚举精确一致**（$\le6\times10^{-14}$），真实记录上在**精确箱号**处与直接掩码求和一致。**§8.2(b) 的数字应视为作废**，但那条结论（不收敛）在新数据上更强地成立。
+
+**(b) 由此暴露的一个操作陷阱**：$C(W)$ 在箱尺度上是不连续的（相消比 $10^4$–$10^6$，多算一列配对就能让比值跳几个单位），所以"在某个 $W$ 处插值"是没有意义的操作。新实现把 `lag` 报成**箱上边界**，使 `cumulative[i]` 明确等于"lag ≤ lag[i]"的直接掩码和。
+
+**(c) ⛔ 已作废：$g\ne0$ 的记录不是物理构型（2026-09-15 复核发现）。** 空间变化的静态 $B$ **不是无源麦克斯韦方程的解**：$B=B_z(y)\hat z$ 满足 $\nabla\cdot\mathbf B=0$，但 $\nabla\times\mathbf B=(\partial B_z/\partial y,0,0)\ne0$ 而 $\mathbf j=0$，于是 Yee 更新 $\partial E_x/\partial t=c^2\,\partial B_z/\partial y$ **每步泵入 $E_x$**。实测（粒子处的插值场）：$g=0.02$ 时第 20 步 $E_x=9.2\times10^{13}$ V/m → 第 800 步 $1.3\times10^{15}$（饱和在 $\sim10^{-3}E_{\rm cr}$）；$g=0$ 时恒为 0。
+
+后果链：
+
+- $|\mathbf u|$ 不守恒（$g=0.065$ 起伏 $6.5\%$，且**精确线性于 $g$**：起伏$/g=0.992,1.005$），而 BK 要求无反冲背景；
+- 我标定的"∇B 漂移 $1319g$"**其实是 $\mathbf E\times\mathbf B$ 漂移**（实测 $E_{\rm sat}/B\times T=3.06$ 自然单位/周期，方向也对得上），真正的 ∇B 漂移在这几何下是 $+x$ 方向约 0.8 自然单位/周期；
+- 盒子的尺寸与起点偏移都是按这个假象标定的。
+
+**所以 $g=0.02$ 与 $g=0.065$ 两行、(e) 的全部退相干论证、以及"退相干把曲线驯服了几个数量级"那句话，全部作废。** $g=0$ 那行**有效**（均匀场是合法解，$\nabla\times\mathbf B=0$）：它确认了管线正确、并确认周期情形不收敛。
+
+| 记录 | $L$ | 相消比 | $1\tau_f$ | $3\tau_f$ | $10\tau_f$ | $0.2L$ | $0.5L$ | $0.9L$ |
+|---|---|---|---|---|---|---|---|---|
+| $g=0$（均匀场，**有效**） | $10.2T$ | $2.0\times10^7$ | $+2625$ | $+3849$ | $+919$ | $-2669$ | $+156$ | $-382$ |
+
+**教训（写进方法论）**：施加到 PIC 里的场必须**同时**满足 $\nabla\cdot\mathbf B=0$ **和** $\nabla\times\mathbf B=\mu_0\mathbf j$（或与 $\partial\mathbf B/\partial t$ 对应的 $\nabla\times\mathbf E\ne0$）。我只查了前者。**静态非均匀磁场在无源 PIC 里根本不允许**——这砍掉了"用场梯度当退相干旋钮"这条路。
+
+**(d) 采样判据是硬约束，磁场构型也不例外。** $\text{margin}=dt\,(\omega\varepsilon/\varepsilon')\max_{\mathbf n}\lvert1-\mathbf n\cdot\mathbf v\rvert/\pi<1$，其中 $\max_{\mathbf n}$ 由**反平行方向**取得（$\approx2$，不是前向 $1/\gamma$ 瓣）。以 $\gamma=5,\chi=0.5$、$dx=0.5$ 自然单位（CFL 给 $dt=0.336$、每回旋周期 916 步）为例：**$\omega_c$ 处 margin $=3.17$，欠分辨**；只有 $\omega\lesssim2.2$（约 $0.6\omega_c$）可用。要分辨 $\omega_c$ 需 $dt\approx0.1$、$dx\approx0.15$，即约 600 格的轨道与约 800 格的盒子。**注意测试台 docstring 里"与判据天然相容"的说法是错的**，已更正。
+
+> ⚠️ 本条也更正了初稿的一处错误：初稿引用的 margin $=0.847$ 出自 `example/bk-testbed.py` 里**手写的**公式（**漏了 $\omega$ 因子**）。改用模块自己的 `sampling_margin` 复核后是 $3.17$。与 §8.3(a) 同类教训：**判据要调用模块函数，不要手抄公式**。
+
+激光构型在同一判据下更差：覆盖谱峰（$a_0^3\omega_0$ 或对撞 $2\gamma^2\omega_0$）需每周期 $10^2$–$10^3$ 步，而 $dx=\lambda/32$ 的 CFL 只给 48。**所以"用磁场"仍是对的选择（欠分辨 2–3 倍 vs 激光的 10–20 倍），但理由不是"天然相容"，而是"便宜得多"。**
+
+**(e) 未解决：非周期测试台重新完全悬空，而且多了一条硬约束。** (c) 作废后，"∇B 漂移当退相干旋钮"这条路被砍掉了。剩下的路径只有**真正宽带的构型**（激光脉冲/尾场），它受 (d) 的采样判据限制；而且激光驱动的电子 $\gamma$ 会变，需要 `banding.py` 支持局域能量相位——**当前实现遇到带 `energy` 的轨迹直接抛 `NotImplementedError`**（这是有意的，见 §8.3(g)）。**因此 §8.2 的"不做"决定维持不变，非周期情形仍未判定。**
+
+**(f) 环境坑**：`Simulation.run()` 每次都会做 PyPI 版本检查，本机无外网时阻塞约 9 s（实测占一次 run 的 95%）。跑算例前设 `LAMBDAPIC_CHECK_UPDATE=0`。
+
+**(g) 第二轮复核发现的其他缺陷（2026-09-15，均已修或已标注）**：
+
+| # | 位置 | 问题 | 状态 |
+|---|---|---|---|
+| 1 | `banding.py` docstring | `lag` 是箱**上边界**，故 `cumulative[i]` 覆盖的是 $\text{lag}<\text{lag}[i]$，docstring 写成了 $\le$（实测两者差 36%） | 已修 |
+| 2 | `banding.py` | 硬编码 `dot_kernel`，忽略 `params.kernel`（trace 核下差 7%） | 已修 |
+| 3 | `banding.py` | 只给 `dirs` 不给 `dom` 时被静默丢弃 | 已修 |
+| 4 | `banding.py` | 默认方向网格是**粗糙**求积：`dE_domega` 与收敛角积分差 $0.63$–$2.4$ 倍，$\omega=4$ 处符号都不同。**它是探针量，不是谱** | 已在 docstring 标注 |
+| 5 | `trajectory.as_trajectory_si` | **到不了局域能量模式**：模块靠 `Trajectory.energy` 切换，而 `local_energy()` 全包无人调用；加速轨迹会被**静默**按固定 $\varepsilon$ 评估（实测 $\omega=1$ 处差 4.5 倍） | 已加 `energy` 入口 |
+| 6 | `trajectory.as_trajectory_si` | `int(n_samples)` 对 $(K,)$ 数组在 numpy 2.4 抛 `TypeError`（记录器写的正是数组） | 已修 |
+| 7 | `callback/trajectory.py` | `np.savez` 会补 `.npz` 后缀，而 `write()` 返回原路径 → 对无后缀路径返回的文件不存在 | 已修 |
+| 8 | `callback/trajectory.py` | "记录与 rank 数无关"的说法过强：id 的高 14 位是 rank，故 rank0 的粒子永远排在 rank1 之前，选到哪个物理粒子取决于 rank↔patch 分配 | 已改为准确表述 |
+| 9 | `example/bk-testbed.py` | $\chi$ 与 $\rho$ 都差一个 $\beta$：`B = CHI/gamma` 实际给出 $\chi=\gamma\beta B=0.4899$、$\rho=48.99$，而 `larmor_radius` 给 48.00 | 已修（$B=\chi/(\gamma\beta)$） |
+| 10 | `example/bk-testbed.py` | 场数组的下标约定错：应为 `p.fields.yaxis[0,:]`（布局是 [内部, 上守卫, 下守卫]），我手写的 `(j-ng)*dy` 使剖面整体错位 $n_g$ 格 | 已修 |
+| 11 | `callback/trajectory.py` | `window=` 补偿的依据存疑：`MovingWindow` 的代码里**确实**读写粒子 `x`（utils.py:766-783、806-825），所以"它会平移坐标"未必错，但**未验证** | 标注为未定 |
+
+**已验证无问题**（限定上面清单的边界）：`banding` 的和与积分器逐位一致（合成圆 7 个频率到 $10^{-13}$，真实记录 4 个频率到 $10^{-11}$）；梯形权重、$j\ge i$ 的加倍、厄米约定、相位符号、前因子全部相符；`truncation_curve` 与 `lag_profile` 自洽（`ratio[-1]=1`）；记录器的数据处理（粒子死亡、跨 patch/跨 rank 迁移在 `mpirun -n 2` 下与单 rank **逐字节相同**、重复 `write()` 文件不变、`start` 阶段确为推进前且确实保留了统一 pusher）；`as_trajectory_si` 的单位换算；测试台初始条件在壳；$\nabla\cdot\mathbf B=0$ 成立（错的是 $\nabla\times\mathbf B$）。
 
 ---
 
@@ -514,5 +580,7 @@ $^*$ $n=1$ 的记录只跨 $1T$，$W\ge T$ 即全和。$n=4$ 时 $W=3T$ 已覆�
 | ~~P1~~ ✅ | ~~提交未落库的成果~~ 已完成 2026-09-14：拆成 `411a63f`（09-11 成果）+ `2563766`（本轮审查修复）两个提交，工作区干净 | — | §2.5 |
 | P3 | 单位适配器 + 轨迹记录回调 + 系综求和 | 2–3 d | §7-D |
 | ~~P3~~ ✅ | ~~绘图改 LaTeX + 期刊风~~ 已完成 2026-09-14：两个绘图模块的公式全部改为 mathtext（`mathtext.fontset="stix"`，配 Times 正文），并统一为**纯白期刊风**（`set_publication_style()`：白底、无网格、四边框轴、刻度朝内、字号 12、dpi 300）。**三条实测硬约束**：(1) 含美元定界符的**行**里汉字变豆腐块（同行缺字 5 / 拆行 0），混合标签用 `_stack()` 拆行，新增 `_check_labels(fig)` 在 `savefig` 前扫描并抛错；(2) `font.family="serif"` + `font.serif=[列表]` **不逐字形回退**（缺字 28），必须让 `font.family` 本身是具体字体列表（缺字 0）；(3) ✓/✗（U+2713/U+2717）在衬线与中文字体里都没有，字体栈末尾需要 DejaVu Sans 作符号回退。另修掉 3 处字号放大后暴露的排版碰撞（V5 / V6 / V1‑V2‑V7 注记、coherence 顶栏） | 0.5 d | README §6.10 |
+| ~~P3~~ ✅ | ~~PIC 集成最小闭环 + 真实轨迹判据~~ **已完成 2026-09-15，并经第二轮对抗复核修正**：`as_trajectory_si` 适配器（含 `energy` 入口）、`TrajectoryRecorder` 回调（挂 `start`）、`banding.py` 判据、`example/bk-testbed.py` 静磁场测试台、8 例新测试。**更正 §8.2(b) 被作废的表**；**作废 (c) 的 $g\ne0$ 两行**（静态场梯度不是麦克斯韦解，见 §8.3(c)）。有效结论只有一条：**真实 PIC 闭合轨道记录上截断曲线不收敛**。另修 11 处缺陷（§8.3(g)） | 1.5 d | §8.3 |
+| P2 | 非周期测试台：**唯一未判定的一格，且现在多一条硬约束——不能再用"静态场梯度"造退相干**（§8.3(c)）。剩路径只有真宽带构型（激光/尾场），受 §8.3(d) 采样判据限制，且需要 `banding.py` 支持局域能量相位（当前对带 `energy` 的轨迹抛错） | 2–3 d | §8.3 |
 | P4 | 在线事件采样 / 自旋分辨核 / NUFFT | 周级 | §7-D/E |
 

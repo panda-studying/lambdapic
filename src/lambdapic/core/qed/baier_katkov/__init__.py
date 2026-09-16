@@ -33,7 +33,7 @@ phases, recoil, positivity and the classical limit.
 """
 
 from .types import Parameters, Spectrum, Trajectory
-from .trajectory import as_trajectory, uniform_trajectory
+from .trajectory import as_trajectory, as_trajectory_si, uniform_trajectory
 from .integrator import BKIntegrator, compute_spectrum
 from . import kernel, phase, units, result, reference
 
@@ -42,6 +42,7 @@ __all__ = [
     "Parameters",
     "Spectrum",
     "as_trajectory",
+    "as_trajectory_si",
     "uniform_trajectory",
     "BKIntegrator",
     "compute_spectrum",
