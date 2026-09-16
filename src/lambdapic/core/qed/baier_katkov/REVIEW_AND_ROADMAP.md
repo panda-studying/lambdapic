@@ -1,756 +1,345 @@
-# Baier–Katkov 模块审查报告与 PIC 集成路线图
+# Baier–Katkov 模块：结论、判据与待办
 
-> 审查日期：2026-09-07；更新：2026-09-08（§2 缺陷全部修复、前因子 4π 修正、Numba 后端、pytest 回归）、2026-09-11（P-1/P-2 收尾、P-3 重新诊断 + 适用性守卫、**P-4 自适应锥角 + 两板网格 + 角度守卫，原文方向判断被实测推翻**）、**2026-09-12（第二轮独立审查：基线全绿复核 + Test B 复现；新增 BUG-7/8/9 与一批输入校验、文档、验证债问题，全部本机复现，集中在 §2.5；其中代码级问题同日全部修复，回归 51→58 例）**、**2026-09-14（§8.2 带状截断判据实验：结论是"不做"——滞后分布不衰减、截断曲线小于整条记录都不收敛；§8.1 的"钥匙"说法作废，§5 P2 该项关闭）**、**2026-09-15（§8.3 PIC 集成最小闭环：单位适配器 + 轨迹记录回调 + 静磁场测试台 + 带宽判据；更正 §8.2(b) 被作废的表）**、**2026-09-16（§8.4 判据检查：生产 LWFA 轨迹上判据通过；实得发射标度 $\omega_c/\omega_0\approx0.6\gamma^{2.3}$，$\lambda_0/20$ 支撑到 $\gamma\approx3$——原写 γ≈5，同日依自身数据订正）**。**2026-09-16 第三轮审查（§8.5）：局域能量相位不平移不变（BUG-10）、局域模式采样守卫漏 ω（BUG-11）、记录器跨 rank 合并空操作（BUG-12）、`window=` 补偿错误（BUG-13）——四条均复现、当日**全部修复**（`835b651`/`a86e02b`/`39499da`/`0578948`，每条附一个修复前会失败的测试，回归 72 例全过）；同日订正 §8.4 磁场附录漏掉的反冲因子、§8.2/§8.4 的若干数字与引用；并修 `_curvature_rate` 的静止段污染（§8.4(f)）；**§8.6：`banding.py` 接上局域能量相位、并在生产 LWFA 的真实加速记录上复算 §8.2 判据——仍然不收敛，"不做"的决定维持**。回归 72→76 例。**范围：[baier_katkov/](lambdapic/src/lambdapic/core/qed/baier_katkov/) 全部源码（约 1400 行）+ 主模拟 QED 管线（[radiation.py](lambdapic/src/lambdapic/core/qed/radiation.py)、[optical_depth.py](lambdapic/src/lambdapic/core/qed/optical_depth.py)、[inline.py](lambdapic/src/lambdapic/core/qed/inline.py)、[simulation.py](lambdapic/src/lambdapic/simulation/simulation.py)）。
-> 所有"已确认"的缺陷都在本机实际运行复现过：第一轮在 Windows 专机（venv，Python 3.11.9），**第二轮在 Linux 集群（`/home/panda/lambdapic/.venv`，Python 3.12.7，numpy 2.4.4）**。
+> 单粒子 Baier–Katkov（BK）双时间积分的参考实现，与主模拟的 LCFA 管线解耦。**本文档是跨会话的唯一事实来源**：结论、依据、未决项。
+>
+> **证据标准**：凡标"实测"的数字都在本机跑过（Linux 集群，`/home/panda/lambdapic/.venv`，Python 3.12.7）。被推翻的旧结论保留一句"（原写 X，已作废）"——它们标记了踩过的坑。历史缺陷的完整叙事在 git 提交里（§7 只留一行一条）。
+>
+> **文档约定**：行内公式用单个美元符；独立公式用双美元符独占一行。写公式时不要在正文里留下落单的美元符（渲染器会贪心吞掉后文）。
+
+| 日期 | 事件 |
+|---|---|
+| 2026-09-07 | 第一轮审查：BUG-1~6 + 三个物理缺口 P-1~P-3 |
+| 2026-09-08 | 上述缺陷全部修复；numba 后端（约 140×）；V8 量子同步辐射交叉验证（P-1） |
+| 2026-09-09 | P-2 局域能量核（相位形式于 09-16 修正） |
+| 2026-09-11 | P-3 重新诊断 + 采样/记录长度守卫；P-4 自适应锥角 + 两板网格 + 角度守卫；圈间相干测量（§3.4）；与 BKS 专著逐式核对（§5.4） |
+| 2026-09-12 | 第二轮审查：BUG-7/8/9 + 一批输入校验（回归 51→58 例） |
+| 2026-09-14 | 带状截断判据实验 → 判定**不做**（§3.5） |
+| 2026-09-15 | PIC 集成最小闭环：单位适配器 + 轨迹记录回调 + 静磁场测试台（11 处缺陷修复） |
+| 2026-09-16 | 生产 LWFA 轨迹上的判据检查（§3.1）；第三轮审查 BUG-10~13 + `_curvature_rate` 静止段 + P-2 证据审计（§7）；§3.5 在真实加速记录上用局域相位复算；本文档重排（原 §1–§9 编号改为现在的结构） |
 
 ---
 
-## 1. 现状总结
+## 1. 模块是什么，能给出什么
 
-模块是一个**物理优先、性能为次**的单粒子参考实现，定位清晰：
+### 1.1 定位与主公式
 
-- 对一条**无反冲经典轨迹** $(t_i, r_i, u_i)$，直接做双时间积分，给出单粒子微分谱：
+对一条**无反冲经典轨迹** $(t_i, \mathbf r_i, \mathbf u_i)$ 直接做双时间积分：
 
-$$ \frac{d^2E}{d\omega\, d\Omega} = \frac{\alpha}{\pi}\,\omega^2 q^2\,\mathrm{Re}\int\!\!\!\int dt_1 dt_2\, N(t_1,t_2)\, e^{-i\Phi(t_1,t_2)}, \qquad \frac{d^2W}{d\omega\, d\Omega} = \frac{1}{\omega}\frac{d^2E}{d\omega\, d\Omega} $$
+$$ \frac{d^2E}{d\omega\, d\Omega} = \frac{\alpha}{4\pi^2}\,\omega^2 q^2\,\mathrm{Re}\iint dt_1 dt_2\, N(t_1,t_2)\, e^{-i\Phi(t_1,t_2)}, \qquad \frac{d^2W}{d\omega\, d\Omega} = \frac{1}{\omega}\frac{d^2E}{d\omega\, d\Omega} $$
 
-- 核 $N$ 有严格迹形式（eq. 7.1）与速度/点积形式（eq. 7.3）两个版本；相位 $\Phi = (\varepsilon/\varepsilon')\,\omega[(t_2-t_1) - n\cdot(r_2-r_1)]$ 含 BK 反冲因子（eq. 5.3）。
-- 单位制为 Compton 自然单位（$c=\hbar=1$，$m_e=1$），`units.py` 提供 SI 双向换算。
-- 角度积分用初始速度方向附近的 Gauss–Legendre 锥积分。
+- 前因子 $\alpha/(4\pi^2)$（Gaussian 单位制，$e^2=\alpha$）。**不要把 Heaviside–Lorentz 的 $e_{HL}^2=4\pi\alpha$ 代进这个公式**——那会多出 $4\pi$，正是历史缺陷 BUG-5 的来源（旧稿此处曾写作 $\alpha/\pi$，已更正）。
+- 核 $N$ 有迹形式（BKS (2.42) 第二式）与速度/点积形式（(2.42) 第一式）；**在壳时两者逐点恒等**（BUG-6 修复后确认），离壳才分道。
+- 相位 $\Phi=(\varepsilon/\varepsilon')\,\omega[(t_2-t_1)-\mathbf n\cdot(\mathbf r_2-\mathbf r_1)]$，反冲因子 $\varepsilon/\varepsilon'$ 来自 (2.25)/(2.40)。**逐顶点局域能量模式下相位必须用路径积分**，见 §3.3。
+- 单位制：Compton 自然单位（$c=\hbar=1$，$m_e=1$），`units.py` 提供 SI 双向换算。
+- 角度积分：绕给定轴（默认初速度方向）的锥面 Gauss–Legendre，见 §3.2。
 
-**验证套件 V1–V7 全部通过**（`python -m lambdapic.core.qed.baier_katkov.validation`，实际运行结果）：
+### 1.2 它能给出而 LCFA 管线给不出的
+
+LCFA 是局域、非相干的 $\int dt\, (\mathrm dW_{\rm LCFA}/\mathrm dt\,\mathrm d\omega)(\chi(t))$——蒙卡事件之间**没有任何相位关系**。差别只有一个根源：**相位**。由此有五条价值：
+
+1. **红外／软光子区精确谱**：LCFA 采样表在 $\omega\lesssim$ 特征红外截断处失效（且表自带 $\chi_{min}$ 截断），BK 双时间积分在此天然有限。
+2. **形成长度非局域效应**：LCFA 假定场在形成长度内不变；BK 对有限长度／变场结构精确，可定量给出 LCFA 的适用边界。
+3. **离散谐波与圈间干涉结构**：wiggler、长脉冲尾场、闭合轨道——量化判据见 §3.4（$n$ 圈谱线中心密度／LCFA 连续谱密度 $=n$）。
+4. **反冲的非微扰处理**：$\varepsilon/\varepsilon'$ 相位因子与 $\varepsilon'=\varepsilon-\omega$ 全阶保留。
+5. **PIC 级对比基准**：作为 LCFA 表的离线校准／验证工具（$\chi$ 边界处）。
+
+### 1.3 边界（做不到的）
+
+- **准经典**：假定 $\chi\lesssim1$；光子／电子自旋已求和平均（`spin_averaged`/`polarization_summed` 固定 `True`，设 `False` 抛 `NotImplementedError`）。
+- **单粒子**：系综求和要调用方自己做加权。
+- **$O(N_t^2 N_\omega N_{dir})$**：numba 让它快（约 140×）但不改标度。
+- **依赖无反冲背景**：带 LCFA 反冲的轨迹不能喂进来（会双计）。
+- **固定轴锥面只在摆幅远小于锥角时有效**：闭环轨道（发射是绕轴的环）必须显式给 `axis=`，见 §3.2。
+
+### 1.4 可用性判据速查（细节见 §3）
+
+| 判据 | 形式 | 阈值／行为 | 守卫 |
+|---|---|---|---|
+| 采样（Nyquist） | $\text{margin}=\Delta t\,(\omega\varepsilon/\varepsilon')\max_{\mathbf n}\lvert1-\mathbf n\cdot\mathbf v\rvert/\pi$ | $<1$；一圈等价 $N_t>4m$ | `SamplingWarning` |
+| 记录长度 | $L/\tau_f$，$\tau_f=(6\varepsilon'/(\omega\Omega_{\rm eff}^2))^{1/3}$ | $>3$ 稳妥；$<1.5$ 报 | `RecordLengthWarning` |
+| 角度分辨 | 方向网格加倍后谱**峰值**的相对变化 | $>2\%$ 报 | `AngularConvergenceWarning` |
+| 免费诊断 | `metadata`：`angular_edge_fraction`、`velocity_swing`、`emission_half_angle`、`sampling_margin`、`record_adequacy` | — | — |
+
+`checks="warn"`（默认）／`"raise"`／`"ignore"` 三档对所有入口统一。**判据必须调用模块函数**（`sampling_margin`／`record_adequacy`／`BKIntegrator.adequacy`），不要手抄公式——§7 的教训 3。
+
+---
+
+## 2. 待办（新会话入口）
+
+### 2.1 未决 / 待做
+
+| 优先级 | 事项 | 说明 | 章节 |
+|---|---|---|---|
+| P1 | **端点亏损的物理修正** | 未做。前置：先有一条真正非重复（宽带／真实 PIC）轨迹，且靶值由 $L\to\infty$ 收敛性定义；$c/L$ 模型已被实测否定 | §4.1 |
+| P1 | **设计文档 `Baier-Katkov.md`** | 悬空引用已由 BKS 专著对照表替代（§5.4），但核与相位的**推导**仍无仓内文档 | §4.5 |
+| P2 | `compute_spectrum` 记录起点静止时的默认轴 | 现退到 $\hat{\mathbf z}$、`velocity_swing` 相对噪声方向算，只靠 $5/\gamma_0$ 地板顶到 $\pi$ 才没出错；喂 PIC 记录时应显式给 `axis=` 并裁到相互作用窗口 | §4.3 |
+| P2 | 闭环／大摆角情形的角度积分 | 需沿速度路径自适应布方向网格（新方法，非参数调整）；现在只做到"报警" | §4.2 |
+| P2 | 带状截断的**重启前置** | 若将来仍要做：先建"频率平均谱 + 平滑窗"的观测量，并在长度 $\gg T$ 的宽带测试台上重做截断曲线 | §4.4 |
+| P3 | 多轨迹批量接口 | 共享 $\omega/\mathbf n$ 网格的多轨迹一次求值 | §6.3 |
+| P4 | 在线事件采样／自旋分辨核／NUFFT | 周级；自旋分辨需要新核 | §6.3 |
+
+### 2.2 已完成的里程碑（压缩）
+
+- **缺陷**：BUG-1~13 全部修复（§7 表，含提交号）；回归从 13 例长到 **76 例**（+1 skip）。
+- **物理验证**：V1–V8 全过（§5.1）；量子区间对精确同步辐射谱 0.1–0.3%（V8）。
+- **性能**：双后端 + numba（约 140×）；$N_t=4000$、4ω×16 方向 0.83 s。
+- **P-2 局域能量**：09-09 实现、**09-16 修正相位**（§3.3，BUG-10）。
+- **P-4 自适应锥角**：09-11 完成（原文方向判断被推翻，见 §3.2）。
+- **PIC 集成闭环**：单位适配器 `as_trajectory_si` + 轨迹记录回调 `TrajectoryRecorder` + 静磁场测试台 + 真实生产轨迹判据检查（§6）。
+- **判据结论**：带状截断**判定不做**（§3.5）；采样判据是硬约束，生产 LWFA 算例通过（§3.1）。
+- **判据工具**：`banding.py` 探针（`lag_profile`/`truncation_curve`）现已支持**局域能量相位**（复用积分器的 `_local_vertex_arrays` 与 `phase.local_phase_tables`；固定分支逐位未动），三条用例钉住"与积分器逐方向一致／恒能量退化／平移不变"。
+
+---
+
+## 3. 判据与已判定结论
+
+### 3.1 采样判据：硬约束，且真实记录恰好卡在边缘
+
+双时间积分里最快的相位速率是 $f\max_{\mathbf n}\lvert1-\mathbf n\cdot\mathbf v\rvert$（$f=\omega\varepsilon/\varepsilon'$，在速度与 $\mathbf n$ **反平行**处取得，$\approx2$），梯形求积每振荡至少两个采样点：
+
+$$\Delta t\,(\omega\varepsilon/\varepsilon')\max_{\mathbf n}\lvert1-\mathbf n\cdot\mathbf v\rvert<\pi \quad\Longleftrightarrow\quad \text{一圈上 } N_t>4m_{\max}.$$
+
+- V8 的 docstring 曾用 $N_t>2m$，**偏松一倍**：$N_t=2m=3980$ 实测仍差 116%，$N_t=4m=7960$ 才到 1.0007。
+- **真实 PIC 记录的判据**（生产 LWFA，$a_0=2$、$dx=\lambda_0/20$、$500\times800$）：网格决定的可用频段 $\omega_{max}=0.372\,N\,\omega_0$（$N=20$ 时 $7.44\,\omega_0$）。实测 margin：$\omega_0$ 处 0.129、$5\omega_0$ 处 0.644、$7.4\omega_0$ 处 0.952——**与公式吻合**，判据可信。
+- 生产算例上 BK 的判据**通过**：$\gamma_{\max}=2.42$ 的电子发射峰在 $\omega_c\approx1.4$–$4.7\,\omega_0<\omega_{max}$。
+- ⚠️ **$0.372N\omega_0$ 是"全球面锥最坏情形"**：`sampling_margin` 只在传入的方向上取 max。限制到前向发射锥后，判据对激光抖动电子（摆角 $\sim1$ rad）放宽 2–5 倍，对尾场俘获电子（$\theta\sim K/\gamma$ 的贝塔管几何）可达 $\gamma^2$ 量级。所以"高 $\gamma$ 不可行"**只对激光抖动电子、全球面锥**成立，不能外推到 LWFA 关心的俘获电子。
+- ⚠️ **局域能量模式下守卫要用 $\omega\cdot f$ 而不是 $f$**（BUG-11）：漏掉 $\omega$ 因子会让 LWFA 尺度（$\omega=\omega_0\approx3\times10^{-6}$ 自然单位）报出 margin $4\times10^4$（真值 0.129），`checks="raise"` 直接拒算。
+
+### 3.2 角度分辨：自适应锥角 + 两板网格 + 守卫
+
+**原文"默认 $5/\gamma$ 对高 $\omega$ 系统性低估"两句都不成立，方向恰好相反。**
+
+- 驻相标度给出 $\theta_c=(4\varepsilon'\Omega_{\rm eff}/(\omega\varepsilon))^{1/3}=(4/m)^{1/3}$，实测半能角 $\approx0.35\theta_c$，且 $\theta_c\gamma$ 从 $\delta=0.02$ 的 $4.6$ 降到 $\delta=0.7$ 的 $0.95$——**软光子端锥最宽**，被截掉的正是本模块承诺的区域。
+- 第二个独立原因：**速度摆幅**。角积分绕固定轴做，而记录上每段辐射绕**瞬时**速度方向；发射角最远到 $\text{swing}+\theta_c$，闭环是 $2\pi$（固定锥只捕到约 1%）。
+- 实测总账（$\gamma=5,\chi=0.5$、0.75 rad 弧）：旧默认 $5/\gamma$ 在 $\delta=0.1/0.3/0.5$ 处漏 **−99.7% / −92.9% / −91.2%**；新默认（自适应 + 两板）为 −0.8% / −1.0% / −1.6%。
+- 已实现：`default_theta_max=min(π, swing+3\max_\omega\theta_c)`（下限仍是历史 $5/\gamma$，**绝不比过去更紧**）；`cone_directions` 两板规则（$1/\gamma$ 内芯单独一组节点——**必需**而非优化：单板跨全空间 $n_\theta=32$ 在 $\delta=0.5$ 处仍错 13%）；`AngularConvergenceWarning`。
+- **守卫的判据是"峰值相对 + 权重最大探针"**：线谱的**线间**值是相消残差，逐点比较会误报（实测线间变化 $>140\%$，线中心只动 $1.9\times10^{-5}$）。线谱需要驱动器自带针对线中心的检查（`coherence.verify_angular_convergence`）。
+- **方法论**：角积分收敛性研究**必须在整数反冲移动谐波上做**。非整数 $m$ 时闭合轨道出现端点项，角积分随节点数在 $\pm20\%$ 间乱跳；换成整数 $m$ 后 $n_\theta\ge24$ 即收敛到 $1e-5$。
+- **未决**：闭环轨道即使把锥开到 $\pi$ 也不收敛（$\mathrm dE/\mathrm d\omega$ 是精确值的 2.39 倍），必须显式传 `axis=`；根治要沿速度路径自适应布网格（§4.2）。
+
+### 3.3 局域能量相位：必须是路径积分
+
+PIC 里电子能量沿途变化，正确形式是逐顶点 $\varepsilon(t_1),\varepsilon(t_2)$ 与 $\varepsilon'_i=\varepsilon_i-\omega$（P-2，超出 BKS 专著 §2.3 的"形成长度内能量视为常数"近似）。
+
+**相位不能写成端点形式。** $\Phi_{ij}=\omega[f_jx_j-f_ix_i]$（$x=t-\mathbf n\cdot\mathbf r$）在 $f$ 变化时**不具平移不变性**：$x\to x+c$ 给相位加 $\omega c(f_j-f_i)$，于是谱取决于记录坐标原点落在哪里——而 PIC 记录的坐标是盒子原点，自然单位下 $10^6$–$10^8$。所谓"差分稳定形式" $\omega[\bar f\Delta x+\Delta f\bar x]$ 只是同一式子的代数改写，$\bar x$ 就是绝对光锥坐标，"能量变化只经小项 $\Delta f$ 进入"这句话是**反的**（小项乘大数）。实测：把记录平移 $(+5000,+300\hat{\mathbf x})$，$d_2E$ 在 $\omega=0.2$ 处由 3696.7 变 9005.4。
+
+**正确形式**是路径积分，逐 $(\omega,\mathbf n)$ 预计算累积表 $T_i$、$\mathbf R_i$（`phase.local_phase_tables`）：
+
+$$\Phi_{ij}=\omega\big[(T_j-T_i)-\mathbf n\cdot(\mathbf R_j-\mathbf R_i)\big],\qquad T_i=\sum_{m<i}\tfrac{f_m+f_{m+1}}{2}(t_{m+1}-t_m)$$
+
+平移不变（只依赖差），$f$ 为常数时**精确**退化到固定能量相位。`local_recoil_phase` 的两点形式只在 $f$ 恒定时有效，传变动的 $f$ **直接报错**。
+
+**逐顶点反冲下 dot 与 trace 严格重合**：$\varepsilon'_i=\varepsilon_i-\omega$ 使在壳恒等式 $(\varepsilon_i-\varepsilon'_i)^2=\omega^2$ 逐顶点成立。经典模式（$\varepsilon'_i=\varepsilon_i$，$f=1$）则完全不含能量历史。
+
+**在壳一致性由调用方负责**：核假定 $\lvert\mathbf b_i\rvert^2=1-m^2/\varepsilon_i^2$。局域的 `b1·b2-1` 与固定的 $(\mathbf b_1-\mathbf b_2)^2$ 两种约定**只在在壳时等价**——拿"变 $\gamma$ 轨迹 + 恒定 $\varepsilon$"去比会离壳、假性差 9%。
+
+**"漏传 `energy`"的代价是核与频率相关的，不能用单个倍数概括**（在生产记录上实测，$\gamma:1.0\to2.4$）：`dot` 核在可分辨频段内固定≈局域（$\le0.06\%$，因为 $\omega/\varepsilon\sim10^{-5}$ 时它的系数几乎不含 $\varepsilon$），而 `trace` 核下固定模式的答案**随任意选的 $\varepsilon$ 摆动 17 倍**（$\varepsilon=\gamma_{\max}$ 17.1、$\bar\gamma$ 2.20、$\gamma_{\min}$ 0.96），局域形式给唯一值。（旧报的"$\omega=1$ 处差 4.5 倍"出自 BUG-10 的坏相位，**已作废**。）
+
+### 3.4 圈间相干：已测到的 LCFA 判别信号
+
+$n$ 圈轨道上，谱线宽度与间距分别是 $\Delta\omega_{\rm line}=\Omega/n$ 与 $\Delta\omega_m=\Omega(\varepsilon'/\varepsilon)^2$，分辨条件 $n\gg(\varepsilon/\varepsilon')^2$。定量预言：
+
+$$\frac{\text{BK 谱线中心密度}}{\text{LCFA 连续谱密度}}=n.$$
+
+**实测（`coherence.py`，$\gamma=5,\chi=0.5,\delta=0.5$，$n=1\dots16$）**：
+
+| $n$ | 线中心密度 $/(T\,\mathrm dP/\mathrm d\omega)$ | $n^2$ | $\Gamma$ | FWHM/间距 | $1/n$ | 线能量比 |
+|---|---|---|---|---|---|---|
+| 1 | 1.0030 | 1 | 1.0030 | 不可测 | 1.000 | 0.834 |
+| 2 | 4.0120 | 4 | 2.0060 | 0.478 | 0.500 | 1.981 |
+| 4 | 16.0480 | 16 | 4.0120 | 0.227 | 0.250 | 4.009 |
+| 8 | 64.1920 | 64 | 8.0240 | 0.1115 | 0.125 | 8.021 |
+| 16 | 256.7679 | 256 | 16.0480 | 0.0555 | 0.0625 | 15.97 |
+
+结论：$n^2$ 律成立且**指数精确为 2**（偏差恒 $+0.30\%$、与 $n$ 无关，是角积分量子化因子）；$\Gamma=n$；线宽 $\propto1/n$（实测常数 $0.444(\varepsilon/\varepsilon')/n$，朴素 Dirichlet 估计给的两倍，**该因子 2 未解**，故只报实测常数）；线能量 $\propto n$。⚠️ 前三个标度逐位可复现，**线能量这一列只有 1% 量级可复现**（复跑 $n=2,8,16$ 得 2.0029/7.9177/15.7285，与表内 1.981/8.021/15.97 差 1.1–1.5%）——它是窗口积分量，别引用到 0.2%。
+
+**边界（诚实记录）**：$n$ 圈相干要求这 $n$ 圈中间**不发生辐射**——发一个光子相位关系就断了，所以 $n^2$ 是**理想化上界**；真正有观测意义的是 undulator。另外 **LCFA 速率本身没有错**（恒定场里与精确谱逐位相同），错的是把它当成能给出谱线结构的工具。
+
+**V8 看不见它的三条原因**：(i) 默认一圈，而 $\delta=0.5$ 处线宽比线间距**大 4 倍**，离散结构早已糊掉——$n=1$ 的 Dirichlet 核**恒等于 1**，一圈记录根本没有线结构；(ii) 对照点取在**谐波中心**，那正是两理论按构造相等的唯一一点；(iii) 靶取的是连续谱包络。
+
+**未做**：带状截断（$\gamma=5$ 下代价可承受，全扫描约 5 分钟），所以"带宽取 $3$–$5\tau_f$ 不破坏 $n^2$ 增强"这条**仍悬着**——但 §3.5 已判定截断本身不该做。
+
+### 3.5 带状截断：**已判定"不做"**
+
+动机是把 $O(N_t^2)$ 降到 $O(N_t)$，并解锁 $n$ 圈相干扫描。**判据实验推翻了它**（闭合轨道 + 非周期记录，两处都测）：
+
+1. **滞后分布根本不衰减（决定性）**：块积分 $M(d)$ 实测 $\lvert M(d)\rvert/\lvert M(0)\rvert=\mathbf{1.000000}$、相位 $=0$ 精确成立（$d=0\dots15$）。解析必然：轨迹严格周期使 $\Phi$ 周期，谐波条件给块相位 $2\pi md$。**即 $n^2$ 律就是 $n^2$ 个等幅同相块的相干叠加**——"远端配对可以丢"与它就是同一句话的反面。
+2. **截断曲线不收敛**：$C(W)/C(\infty)$ 在 $W$ 小于整条记录时上下乱跳、含负值。闭合轨道上 $W=3T$（覆盖记录 75%）时仍是全和的 **3.45 倍**；**真实非周期记录上同样不收敛**（见本节末的复核）。
+3. **朴素带破坏 $n^2$**：$\Gamma=$ 带和$/(n\cdot\text{LCFA})$ 与 $n$ **无关**（带和 $\propto n$、全和 $\propto n^2$）。判据是"$\Gamma$ 变成 $n$-无关"，不是 $\Gamma\to1$。
+4. **梳状带既不准也不省**：`comb/full` $=3.06/1.59/2.45$（$B=1/3/5$）——**比全和还大**；保留对数占比 16%/47%/79%，加速比 $1/(0.16B)=6.25/B$，即 $B=3$ 时约 2×、$B=5$ 时约 1.25×，**没有渐进收益**。
+5. **相消比 $2.5\times10^5$**（闭合轨道线中心）：全和稳定是因为相消发生在求和内部，**任何把双时间和拆成子和的方案（截断、分块）都会继承这个放大因子**。
+
+**真实加速记录上的复核（2026-09-16，用正确的局域相位）**：为此把 `banding.py` 的探针接上了局域相位（§2.2；复用积分器自己的核与累积相位表，固定分支逐位未动）。记录：生产 LWFA，$\gamma:1.00\to2.39$、前 69% 静止、相互作用窗口 155 步 $=5.4$ 个激光周期。$C(W)/C(\infty)$ 在 $1$–$3\tau_f$ 处 $4.83/0.80/1.00/1.36$ 与 $-8.47/3.05/1.00/-0.70$ 之类乱跳，**丢掉 90% 的滞后范围也不收敛**（$C(0.9L)$ 从 0.26 到 4.83）；相消比 $2\times10^1$–$3.4\times10^3$，比闭合轨道温和，但结论相同。
+
+**所以：不实现带状截断。** 它既不能解锁 $n$ 圈扫描（那正是它破坏的东西），在测过的每种情形下也都不收敛。$n$ 圈扫描的候选工具只剩**周期性分块**——而且它只需要**一次单圈全和**（严格周期时 $M(d)=e^{-i\phi d}M(0)$，$I_n=M(0)\sin^2(n\phi/2)/\sin^2(\phi/2)$，Fejér 核，连续时间下严格），原稿的"$O(n)$ 次单圈积分"与"块和数值稳定性是前置障碍"都随之消失。
+
+**重启前置条件**（§4.4）：观测量换成**频率平均谱**、掩码换成**平滑窗**（线中心判据只能否掉相干扫描，不能否掉粗粒化近似——(c) 里 $\Gamma$ 与 $n$ 无关恰是非相干极限的特征，$\Gamma$ 对 $B$ 敏感更像是硬矩形窗的振铃）；且要在长度 $\gg T$ 的宽带测试台上重做（本次真实记录只有 $5.4T$）。
+
+**可信度分级**：本节数字来自两个探针（`/tmp/band_probe.py` 逐对掩码、`/tmp/band_curve.py` 逐 lag 累积），**都未用 `banding.py` 复算过**。其中 (b)/(e) 走分箱路径、数字已作废；(c)/(d) 走逐对掩码路径，结构结论保留。用入库实现复算过的只有本节末那一段真实记录。
+
+### 3.6 有限记录与形成长度：真实失败模式是端点亏损
+
+原诊断（"硬截断端点辐射污染整个谱"，例：闭环 $\omega/\varepsilon=0.5$ 处 $\mathrm dW/\mathrm d\omega=-4922$）**不成立**。实测结论：
+
+- **$-4922$ 是采样混叠**，不是边界项：闭环 $\gamma=10,\chi=0.5$、$\delta=0.5$ 处 $m\approx1990$，$N_t=512$ 欠采样 8 倍。充分采样后闭环在该频率没有边界问题（比值 $N_t=7960$ 时 1.0007）。
+- **真正的失败模式是低 $\omega$／记录短于形成时间，且亏损局域在记录两端的 $\sim\tau_f$ 邻域**（不是污染整个谱）。比值随 $L/\tau_f$：$1.60\to1.000$、$1.44\to0.886$、$1.28\to0.719$、$1.12\to0.480$、$0.96\to0.209$、$0.80\to-0.032$、$0.64\to-0.187$。整数圈精确（2.00 圈→2.000，3.00 圈→3.000）。$\tau_f\propto\omega^{-1/3}$ 随 $\omega$ 减小而增大——**低 $\omega$ 最严重，恰是本模块承诺的软光子区**。
+- **形成长度窗口不是它的解**：窗口把被积函数乘以 $\le1$ 的因子，而有限记录的自然权重是 $(L-\lvert\tau\rvert)$。实测 $\tau_w=100$ 把 $\delta=0.5$ 的 $-62.8$ 压到 $-0.057$（好），同时把一次谐波的 $+4.10$ 压到 $-0.139$（**杀掉物理信号**）。窗口的正确定位是性能与非均匀场退相干建模。
+- **守卫已实现**：`SamplingWarning`（margin $\ge1$）与 `RecordLengthWarning`（$L/\tau_f<1.5$，阈值据实测塌缩边界定的，不依赖任何标度模型）。**未做**物理修正（§4.1）。
+
+---
+
+## 4. 未决与开放问题的讨论
+
+### 4.1 端点亏损的物理修正（未做）
+
+**为什么没做**：前置问题没解决——$L\lesssim\tau_f$ 时"弧长 × 常数场辐射率"**本身就不是正确靶值**。
+
+收敛性研究（2026-09-11）的实测结论：
+
+1. **锐谱线处 $\mathrm dE/\mathrm d\omega\propto L^2$**（与采样密度无关，整数/非整数圈皆然）。这是正确的物理（谱线：振幅 $\propto L$、密度 $\propto L^2$、线宽 $\propto1/L$），但后果是 `reference.py` 里"一圈 $\mathrm dE/\mathrm d\omega$ = 连续谱密度 $T\,\mathrm dP/\mathrm d\omega$"的对应**只对一圈成立**；对多圈记录拿 $L\cdot\mathrm dP/\mathrm d\omega$ 作靶是**范畴错误**——它同时是 §3.4 圈间相干的直接观测。
+2. **换到 chirped 宽带轨迹后**，$dE/d\omega\propto L^{1.07}$（确实线性、无 $L^2$），但亏损**不服从 $c/L$**：亏损会变号（有时过冲），$\text{deficit}\cdot L/\tau_f$ 在 $-0.6$ 到 $2.9$ 之间游走。主导 $L$ 依赖的是谱分辨率／相干结构，不是光滑的 $c/L$ 尾巴。
+3. 唯一稳健的现象仍是 **$L\lesssim\tau_f$ 时谱塌缩（可变负）**。
+
+**结论**：不要基于 $c/L$ 模型做端点修正。要继续就需要一条真正非重复（宽带／随机或真实 PIC）的轨迹，且靶值必须由 $L\to\infty$ 收敛性定义。
+
+### 4.2 闭环／大摆角情形的角度积分（未决）
+
+固定轴锥面只在摆幅远小于锥角时有效。闭环轨道即使自适应锥开到 $\pi$、$n_\theta=16$ 也不收敛（$\mathrm dE/\mathrm d\omega$ 是精确值的 2.39 倍）；现在只能**报警**（旧默认在此情形下静默返回约 1% 的量），或由调用方显式传 `axis=`（对称轴／束轴）。根治要沿速度路径自适应布置方向网格，属于新方法。
+
+### 4.3 `compute_spectrum` 在记录起点静止时的默认轴（未决）
+
+$\beta_0\approx0$（PIC 记录开头激光还没到）时默认轴退到 $\hat{\mathbf z}$、`velocity_swing` 相对噪声方向计算，只靠 $5/\gamma_0$ 的地板把锥角顶到 $\pi$ 才没出错。**当前用法**：喂 PIC 记录时显式给 `axis=`，并裁到相互作用窗口。
+
+### 4.4 带状截断若重启的前置条件（未决）
+
+（a）观测量换成**频率平均谱**、掩码换成**平滑窗**；（b）测试台必须长度 $\gg T$ 且真宽带——目前最接近的是 §3.5 那条 5.4 个激光周期的真实记录，它只有 $5.4T$，而每次更接近真实的测试都指向同一结论（不收敛）。
+
+### 4.5 设计文档缺失（未决）
+
+模块里几乎所有 "eq. 7.1"、"sec. 4.2" 之类的引用都指向不存在的 `Baier-Katkov.md`。**已缓解**：与 BKS 专著的逐式对照表已建立（§5.4），核与相位的来源可审计。**仍未做**：核与相位的**推导**（尤其 P-2 的局域推广，它超出专著范围）。
+
+### 4.6 文档与验证债（仍是开口的，都不影响物理结论）
+
+- **README §8 环境整节仍是 Windows 旧值**（`d:/Desktop/.../python.exe`、Python 3.11、`PYTHONUTF8=1`、"C 扩展未编译"、V1–V8 约 17 s）。本机实为 Linux、Python 3.12.7、16 个 `.so` 全编译、V1–V8 约 6 s。应整节替换为 `CLAUDE.md` 的环境说明。
+- **`kernel.airy_identity` 无调用者、无测试**：它在 `__all__` 里、README 说它"仅用于 validation V1"，但全树无调用者——`validation.check_airy_identity` 是**另一个函数**，公式内联重推。公开 API 与测试各自演化的典型。
+- **`phase.classical_phase`/`recoil_phase`/`local_recoil_phase` 仍不在计算路径上**（积分器用内联副本）。局域路径现在**确实**调用了 `local_phase_tables`/`recoil_frequency`，所以只剩固定路径的两点形式是漂移风险；实测两者一致 $\le10^{-10}$，当前不是错误。
+- **README 的 V5 描述说过头**：说直线记录上"BK ≈ LW"，实测 $BK=-2.83\times10^{-7}$ vs $LW=+1.86\times10^{-4}$，比值 $1.5\times10^{-3}$——**两者并不一致**。物理无问题（dot 核的真空减除消掉直线项，而有限记录的 LW 振幅不消），是那句文档描述错。
+- **`test_record_adequacy_tracks_the_open_arc_deficit` 没有检验它声称的物理**：三条轨迹的采样密度恒为 1200/圈，$L/\tau_f$ 严格 $\propto$ 圈数，断言退化成"阈值区间 + 构造上必然成立的单调性"；docstring 里那张谱亏损表（0.89@0.9 圈 … $-0.19$@0.4 圈）**从未被执行**。
+- **`test_prefactor_constant` 是变更探测器**：断言 `PREFACTOR == fine_structure/(4π²)`，即 `integrator.py` 的定义式本身，不检验归一化；真正钉绝对归一化的是 V8 与 Schwinger 对照。
+- **README §6.5 漏参数**：`compute_spectrum` 的签名说明里没有 `checks`。
+
+---
+
+## 5. 验证体系与可信度
+
+### 5.1 V1–V8（`python -m lambdapic.core.qed.baier_katkov.validation`，约 6 s）
 
 | 检查 | 内容 | 结果 |
 |---|---|---|
-| V1 | Airy 相位恒等式（eq 9.6） | rel_err = 6.9e-7 ✓ |
-| V2 | $\|A\|^2$ = 速度核双时间积分（验证积分器与 $\exp(-i\Phi)$ 相位符号） | rel_err = 2.5e-12 ✓ |
-| V3 | 软光子 BK → LW（闭合圆环，**反冲移动谐波** $\omega_m$ 处） | 比值 0.9995 → 0.9980，即 $1-\delta$ 的 $O(\omega/\varepsilon)$ 量子修正 ✓（在裸 $m\Omega$ 处评估则 0.999→1.030，为截断伪影，见 BUG-6/P-3） |
-| V4 | Larmor 绝对归一化 | 精确谱闭合 0.996；谐波比值 0.946→0.991 收敛 ✓ |
-| V5 | 直线 ≈ 零辐射 | \|BK/弯曲\| = 9.8e-10 ✓ |
-| V6 | 角积分谱正性（闭合轨道，$\omega_m$ 处） | min(dW/dω) = +1.12，total_W = 0.0660 ✓ |
-| V7 | trace ≡ dot 在壳恒等式（$\omega/\varepsilon=0.7$ 硬光子） | rel_err = 6.2e-16 ✓ |
-| V8 | **量子同步辐射交叉验证**（$\gamma=10$，$\chi=0.5$，$\delta=0.05$–$0.5$，$N_t=7960$） | BK/精确 = 0.997–1.001（dot 与 trace 相同），而量子/经典 = 0.96→0.44 ✓ |
+| V1 | Airy 相位恒等式（eq 9.6） | rel_err = 6.9e-7 |
+| V2 | $\lvert A\rvert^2$ = 速度核双时间积分 | rel_err = 2.5e-12 |
+| V3 | 软光子 BK → LW（闭合圆环，**反冲移动谐波**处） | 0.9995 → 0.9980，即 $1-\delta$ 的 $O(\omega/\varepsilon)$ 量子修正 |
+| V4 | Larmor 绝对归一化 | 精确谱闭合 0.996；谐波比值 0.946→0.991 |
+| V5 | 直线 ≈ 零辐射 | $\lvert$BK/弯曲$\rvert$ = 9.8e-10 |
+| V6 | 角积分谱正性 | min(dW/dω) = +1.12，total_W = 0.0660 |
+| V7 | trace ≡ dot 在壳恒等式（$\omega/\varepsilon=0.7$ 硬光子） | rel_err = 6.2e-16 |
+| V8 | 量子同步辐射交叉验证（$\gamma=10$，$\chi=0.5$） | BK/精确 = 0.997–1.001，量子/经典 = 0.96→0.44 |
 
-虚部诊断：numpy 参考路径实测 $\mathrm{Im}/\mathrm{Re} \lesssim 10^{-10}$（舍入级），numba 路径显式利用厄米对称性，虚部恒为 0。回归测试见 [tests/test_baier_katkov.py](lambdapic/tests/test_baier_katkov.py)（含参照公式三重锚定与量子交叉验证）。
+虚部诊断：numpy 路径 $\mathrm{Im}/\mathrm{Re}\lesssim10^{-10}$，numba 路径构造性地为 0。
 
-**结论：模块的骨架、相位符号和经典极限*形状*是可靠的；但存在 6 个已复现的代码缺陷（含一个使所有绝对量偏大 $4\pi$ 的前因子错误 BUG-5，和一个 trace 核抄写错误 BUG-6）、1 个文档债务问题，以及 3 个会直接影响 PIC 应用的物理缺口（见下）。缺陷已于 2026-09-08 全部修复；量子区间已由 V8 对精确谱验证到 0.1–0.3%。**
+### 5.2 回归
 
----
+`python -m pytest tests/test_baier_katkov.py -n 0 -q` — **76 例**（+1 skip），约 20 s；含 `tests/test_trajectory_recorder.py` 与 `tests/mpi/test_trajectory_recorder.py`（跨 rank 记录的 MPI 用例）。
 
-## 2. 已确认的代码缺陷（均已复现，2026-09-08 已全部修复）
+**钉住行为的用例**：numba≡numpy（非均匀网格 × 3 核 × 2 相位 × 固定/局域）、虚部、$\lvert A\rvert^2$ 恒等式、Schwinger 绝对归一化、`recoil` 选项生效、非法输入拒绝、局域相位的**平移不变**、`banding` 探针与积分器逐方向一致、记录器的跨 rank 合并。
 
-> 修复后回归：V1–V7 结果逐位不变；每项修复均有复现脚本验证（见各条"修复"注记）。
+### 5.3 V8 能区分什么、不能区分什么（容易误读）
 
-### BUG-1（严重，语义错误）：`Parameters.recoil` 从未进入计算路径 ✅ 已修复
+- **V8 的对照物就是项目的 LCFA 速率**（恒定场里 Macdonald ≡ Airy ≡ `optical_depth_tables.gen_photon_prob_rate_for_delta`，差 $10^{-15}$）——这不是巧合，是 LCFA 的定义。所以 V8 **不可能**区分 BK 与 LCFA，它检验的是**实现**（前因子、反冲相位、$\omega^2/\gamma^2$ 接触项、dot/trace 核）。BUG-6 就是这样被抓出来的。
+- 它看不见 LCFA 缺失的东西，三条原因见 §3.4。它也回答不了"BK 能不能喂 PIC 轨迹"——那是采样判据的问题（§3.1）。
+- **已核查干净的负面结果**：双后端在非均匀网格上 × 3 核 × 2 相位 × 固定/局域一致到 $10^{-14}$；折行配对覆盖每行恰好一次；用文档函数独立重写的朴素双重和复现 `double_time_integral`；V8 对 scipy Macdonald/Airy、V2 的代数恒等式、V7 的在壳恒等式、与 LCFA 表的交叉核对都**确实独立，未发现循环论证**。
 
-[integrator.py:201-213](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L201-L213) 中 `BKIntegrator.d2_probability/d2_energy` 只把 `params.epsilon/mass/charge/kernel` 传给底层函数，**从不传 `recoil`、`spin_averaged`、`polarization_summed`**。而 [types.py](lambdapic/src/lambdapic/core/qed/baier_katkov/types.py) 的 `Parameters` 却暴露这些字段、`epsilon_prime()`/`recoil_factor()` 方法，并在 metadata 里记录 `recoil=self.params.recoil`。
+### 5.4 与 BKS 专著的逐式对照（2026-09-11）
 
-复现：`Parameters(epsilon=γ, recoil="classical")` 与默认 `"baier_katkov"` 给出**逐位相同**的结果（-0.0041752842...），而显式传 `phase="classical"` 的正确结果为 -0.0041810726。即：
+核与相位的编号来源（专著 *Electromagnetic Processes at High Energies in Oriented Single Crystals* §2.2–§2.4，pp. 55–77）：
 
-- 用户设置 `recoil="classical"` 会被**静默忽略**，计算仍用 BK 反冲；
-- 更糟的是输出的 `Spectrum.metadata` 会**谎报** `recoil: classical`。
-
-修复（2026-09-08）：新增 `_recoil_args()`，`BKIntegrator.d2_probability/d2_energy` 现在把 `params.recoil` 映射为 `phase`/`epsilon_prime` 传入（`"classical"` → `phase="classical", epsilon_prime=epsilon`）。回归验证：`recoil="classical"` 与显式传参结果逐位一致（diff = 0），且与 BK 反冲结果不同。另在 `Parameters.__post_init__` 中对 `spin_averaged=False` / `polarization_summed=False` 抛 `NotImplementedError`（当前只有自旋平均/极化求和核）。
-
-### BUG-2：`kernel` 字符串不校验，非法值静默回退 ✅ 已修复
-
-[integrator.py:98](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L98)：`kern = dot_kernel if kernel == "dot" else trace_kernel`。实测 `kernel="foo"` 不报错，静默按 trace 核计算。此外 `"velocity"`（validation V2 内部使用）有效但**未写入 docstring**，属于隐藏 API。
-
-修复（2026-09-08）：`double_time_integral` 现校验 `kernel in ("dot", "trace", "velocity")` 否则抛 `ValueError`；`"velocity"` 已写入 docstring；dispatch 重构为显式三分支（`"velocity"` 不再先赋 trace 核再被覆盖的死代码路径）。
-
-### BUG-3：`omega == epsilon` 除零 / `omega > epsilon` 无守卫 ✅ 已修复
-
-`epsilon' = epsilon - omega`，[integrator.py:90](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L90) 及 `phase.recoil_frequency` 中 `omega * epsilon / epsilon_prime`。实测 `omega == epsilon` 抛裸 `ZeroDivisionError`；`omega > epsilon` 时 $\varepsilon'<0$，反冲因子变负、相位反号，产生**非物理但有限**的结果，无任何警告。
-
-修复（2026-09-08）：`double_time_integral` 在 `epsilon_prime=None`（BK 反冲默认）时校验 `omega < epsilon`；`phase.recoil_frequency` 校验 $\varepsilon' > 0$；`Parameters.epsilon_prime()` 同步守卫。均抛带具体数值信息的 `ValueError`（经典模式 `epsilon_prime=epsilon` 不受限，符合物理）。
-
-### BUG-4：`trapz_weights` 单样本崩溃 ✅ 已修复
-
-[integrator.py:50](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L50)：`time` 长度为 1 时 `dt` 为空数组，`w[0] = dt[0]/2` 抛 `IndexError`。实测复现。
-
-修复（2026-09-08）：`trapz_weights` 对单样本返回 `[0.0]`（不再 `IndexError`）；`Trajectory.__post_init__` 拒绝 `Nt < 2`（`ValueError: at least two time samples are required`），从源头挡住无意义的双时间积分。
-
-### BUG-5（严重，归一化错误）：辐射前因子混用单位制，所有绝对量偏大 $4\pi$ ✅ 已修复
-
-第一轮审查漏掉，原因是 V4 "Larmor 归一化通过"——但 V4 的参考公式与代码带着**同一个**错误，比值类检验（V3/V4/V5）对前因子全部免疫。证据链：
-
-1. **推导**：Liénard–Wiechert 谱 $\frac{e^2\omega^2}{4\pi^2 c}\left|\int \mathbf n\times(\mathbf n\times\boldsymbol\beta)\,e^{i\omega(\cdots)}dt\right|^2$（Jackson 14.67）是**高斯制**，$\hbar=c=1$ 时 $e^2=\alpha$，前因子应为 $\alpha/(4\pi^2)$。原 [units.py](lambdapic/src/lambdapic/core/qed/baier_katkov/units.py) 注释把 Heaviside–Lorentz 制的 $e^2=4\pi\alpha$ 代进高斯公式得到 $\alpha/\pi$。BK 公式 $dw=\frac{\alpha}{(2\pi)^2}\frac{d^3k}{\omega}\int\!\!\int\cdots$ 同样是 $\alpha/(4\pi^2)$。
-2. **独立标定**：同步辐射每圈能量损失 $\frac{4\pi}{3}\frac{\alpha\gamma^4}{\rho}$ ⇒ 88.5 keV·$E[\mathrm{GeV}]^4/\rho[\mathrm m]$，只有 $P=\frac23\alpha\gamma^4\beta^4/\rho^2$ 对得上；原 V4 用的 $\frac{8\pi}{3}$ 多了 $4\pi$（高斯 Larmor 的 $\frac23 e^2$ 配了 HL 的 $e^2$），其 $dP/d\omega=2\sqrt3\,\alpha\gamma/\rho\,F$ 亦然（标准 Schwinger 谱是 $\frac{\sqrt3}{2\pi}\alpha\gamma/\rho\,F$）。
-3. **实测**（$\gamma=30$、$\rho=10^4$、$N_t=4000$，对标准 Schwinger 谱）：code_LW/standard = 12.29 ($m$=16) → 12.45 ($m$=64)，趋向 $4\pi=12.57$；BK 同样。
-4. **与项目自身不一致**：LCFA 表 [optical_depth_tables.py:124-131](lambdapic/src/lambdapic/core/qed/optical_depth_tables.py#L124-L131) 的 Airy 公式（前因子 $\alpha/\varepsilon$）经典极限恰给出标准 Schwinger 谱，即本模块此前所有 $dW/d\omega$、$W$、$E$ 比项目自己的 LCFA 大 12.57 倍。
-
-修复：`integrator.PREFACTOR = alpha/(4 pi^2)`，`d2_energy` 与 `classical_d2_energy` 统一使用；V4 的 $P$、$dP/d\omega$ 去掉 $4\pi$；units.py 注释、模块 docstring、README 公式同步改正。回归：V4 闭合仍 0.996、谐波比值仍 0.946→0.991（比值不变，说明修正自洽）；V6 total_W 由 0.831 变为 0.0661（恰为 $1/4\pi$）；新增 `test_absolute_normalization_schwinger` 在 $m=64$ 处对标准 Schwinger 谱守护到 3% 以内。
-
-### BUG-6（物理错误）：trace 核抄写错误，"dot 与 trace 相差 $O(\omega)$"是假象 ✅ 已修复
-
-由 V8 量子交叉验证发现（§4 P-1）。原 [kernel.py](lambdapic/src/lambdapic/core/qed/baier_katkov/kernel.py) 的 trace 核为 $-\frac{m^2}{\varepsilon\varepsilon'}\left[1+\frac{\varepsilon^2+\varepsilon'^2}{4m^2}(\mathbf b_1-\mathbf b_2)^2\right]$，即 $(\mathbf b_1-\mathbf b_2)^2$ 的系数为 $\frac{\varepsilon^2+\varepsilon'^2}{4\varepsilon\varepsilon'}$；对精确量子同步辐射谱它系统性偏低（$\delta=0.05\to0.5$ 时 0.94→0.29），而 dot 核一致到 0.1%。推导在壳恒等式：用 $(\mathbf b_1-\mathbf b_2)^2 = 2-2/\gamma^2-2\mathbf b_1\!\cdot\!\mathbf b_2$，系数取 $\frac{\varepsilon^2+\varepsilon'^2}{4\varepsilon'^2}$ 时常数项合并为 $\frac{(\varepsilon-\varepsilon')^2 m^2}{2\varepsilon^2\varepsilon'^2}=\frac{\omega^2}{2\varepsilon'^2\gamma^2}$，trace 与 dot **逐点恒等**（任意 $\omega$，数值差 2e-16）。原系数少了一个因子 $\varepsilon/\varepsilon'$。
-
-修复：kernel.py `trace_kernel` 与 integrator.py `_kernel_coefficients` 改为 $-\frac{m^2}{\varepsilon\varepsilon'}-\frac{\varepsilon^2+\varepsilon'^2}{4\varepsilon'^2}(\mathbf b_1-\mathbf b_2)^2$；kernel.py 模块文档重写（删除"受控改写、相差 $O(\omega)$"的错误说法，记录验证史）；V7 改为在硬光子 $\omega/\varepsilon=0.7$ 处检验恒等式到 1e-12（原来只在 $\omega=10^{-3}$ 软极限检验到 1e-2，因此没能发现）；V8 中两核结果逐位相同。**后果**：dot/trace 之争终结，两者是同一函数；只有将来做局域能量核（$\varepsilon_1\ne\varepsilon_2$，P-2）时，含 $b_i^2=1-m^2/\varepsilon_i^2$ 的 trace 形式才是基本形式。
-
-### 次级问题 ✅ 已全部修复（2026-09-08）
-
-- **虚部诊断被静默丢弃**：[integrator.py:130](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L130) `d2_energy` 只返回 `I.real`，与模块 docstring "imaginary part is kept as a numerical diagnostic, never dropped silently" 的承诺矛盾。→ `d2_energy`/`d2_probability` 新增 `diagnostics=False` 开关，为 `True` 时返回 `(value, value_imag)`；默认行为不变。实测 Im/Re ≈ 1e-16。
-- **`Trajectory.__post_init__` 不校验 `time.ndim == 1`**（`as_trajectory` 校验了），直接构造 2-D time 会在积分器里得到难以理解的错误。`Spectrum.__post_init__` 同理不校验 `dE_domega` 形状。→ 两处校验均已补上。
-- **`kernel.py` 里 `fine_structure` 只是重新导出**（[kernel.py:35](lambdapic/src/lambdapic/core/qed/baier_katkov/kernel.py#L35)），模块内未使用，建议从 `__all__` 移除以免误导。→ 已移除（全模块 grep 确认无人从 `kernel` 导入它）。
-- **`double_time_integral` 中 `kern` 对 `"velocity"` 会先赋成 trace 核再被覆盖**（[integrator.py:98-115](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L98-L115)），属于死代码路径，重构 dispatch 时一并清理。→ 随 BUG-2 一并清理。
-
-### 第二轮审查新发现（2026-09-12，全部已在本机复现）
-
-> **2026-09-12 同日修复**：本小节标题与"次级""文档债"两条列出的**代码级问题已全部修掉**（BUG-7/8/9 + 输入校验 + metadata 谎报），并补 7 个 pytest 用例钉住行为。回归 **58 例全过**（原 51 例全部保持通过），V1–V8 数值**逐位不变**（含 V6 的 `total_W = 6.599e-02`）。**未修**的只剩纯文档项：`kernel.airy_identity` 无调用者/无测试、V5 文档说过头、README §8 环境仍是 Windows 旧值、`phase.*` 公开函数不在计算路径上。修复清单见各行 ✅。
->
-> 环境：Linux 集群，`/home/panda/lambdapic/.venv`（Python 3.12.7，numpy 2.4.4）。基线先行核实：V1–V8 全过（数值与本文档记录一致）、`tests/test_baier_katkov.py` **51 例全过**、单粒子示例端到端正常、Test B 复现三个主标度（$n^2$ 律偏差仍为 $+0.30\%$、$\Gamma=n$、线宽 $\propto1/n$）。
-
-#### BUG-7（中等，诊断报错位置）✅ 已修复：`angular_edge_fraction` 指向靠轴的节点，不是锥边缘节点
-
-[integrator.py:964](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L964) 用 `d2E[:, -n_phi:]` 取"最外侧 $\theta$ 节点"，docstring 断言"directions 按内板在前、外板在后排列，最后 `n_phi` 个样本是离 `theta_max` 最近的节点"。**这个断言与 `cone_directions` 的实际排序相反**：`cos_theta` 由 `roots_legendre` 升序节点构造，故 $\theta$ **降序**——索引 0 才是离 `theta_max` 最近的节点。
-
-复现（$n_\theta=4,\theta_{max}=1.0$）：各节点 $\theta=[0.9616,0.8065,0.5580,0.2533]$；只有索引 0 有值时返回 `0.0`，只有最后节点有值时返回 `1.0`——**判据完全反了**。真实谱上（$\gamma=10$ 圆、$\theta_{max}=0.6$、$n_\theta=8,n_\phi=4$）metadata 报 `angular_edge_fraction=0.033`，而真正锥边缘节点（$\theta=0.594=\theta_{max}$）承担 **38.6%** 的角积分。
-
-后果：README §3.7 与本文档 P-4(d) 把它推荐为"锥角够不够"的**免费判据**（"大 ⇒ 该抬高 `theta_max`"）。在闭环这种固定锥本就不收敛的情形（P-4(e)）它本应报警，却报出一个小值，**恰好掩盖了唯一该被它暴露的信号**。两板模式下标量取的是贴近 `split` 的节点，既不是边缘也不是轴，语义更含糊。
-
-**修复**：`angular_edge_fraction(d2E, dom, n_phi, offset=0)` 改取 `slice(offset, offset + n_phi)`；`compute_spectrum` 用新增的 `cone_bands` 算 `offset`（单板 `0`、两板 `n_inner * n_phi`）并传入；`cone_directions` 与 `cone_bands` 的 docstring 写明"板内 $\theta$ **递减**，离 $\theta_{max}$ 最近的节点是最后一板的**头** $n_\phi$ 个"。实测：修复后 metadata 的 `angular_edge_fraction` **精确等于**最宽 $\theta$ 节点的真实份额（同轴网格下两边都是 0.04932，相对误差 $10^{-12}$），而旧值 0.03265 是轴节点。新增 `test_angular_edge_fraction_points_at_the_cone_edge`（合成输入：边缘节点独占→1、轴节点独占→0、两板 `offset`）+ `test_angular_edge_fraction_metadata_matches_the_widest_node`（与真实谱最宽节点对拍，并断言两者份额之差 $>10^{-2}$，使断言有牙齿）。
-
-#### BUG-8（低-中，静默 NaN / 裸异常）✅ 已修复：$\omega=0$ 无守卫
-
-`d2E` 在 $\omega=0$ 处恰为 0（前因子 $\omega^2$），而 `dW = dE/omega`（[integrator.py:1324](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L1324)、733、1190）给出 $0/0$：实测 `dW_domega[0] = nan`、`total_probability() = nan`（NaN 静默传播到整张谱的积分），`d2_probability(omega=0.0)` 抛裸 `ZeroDivisionError`。`_final_energy` 与 `Spectrum.__post_init__` 都不拦 $\omega=0$、也不拒 NaN。BUG-3 只守了 $\omega\ge\varepsilon$ 这一端。
-
-**修复**：`compute_spectrum` 的网格校验 + `d2_probability`/`BKIntegrator.d2_probability`/`d2_probability_batch`/`Spectrum.__post_init__` 四处守卫，$\omega\le0$ 一律抛带解释的 `ValueError`（$\omega=0$ 的 `dE/d\omega` 本身有定义且为 0，仍可用 `d2_energy`）。附带修好 `formation_time`：$\omega\le0$ 处干净返回 $\inf$（物理上 $\tau_f\to\infty$），不再触发除零 RuntimeWarning；`record_adequacy` 原有逻辑把 $\inf$ 映射为"判据不适用"，正是 $\omega=0$ 应有的行为。新增 `test_zero_and_negative_omega_are_rejected`（含 `Spectrum` 拒 NaN/inf）。
-
-#### BUG-9（低-中，公开 API 危险）✅ 已修复：`Trajectory.mass` / `Trajectory.charge` 从不进入计算路径
-
-`Trajectory` 的 `mass`/`charge` 字段（[types.py:53-54](lambdapic/src/lambdapic/core/qed/baier_katkov/types.py#L53-L54)）被 README §6.1 当作有效字段列出，但积分器只读 `Parameters` 的对应字段（[integrator.py:1174](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L1174) 等）。实测：`Trajectory(charge=3.0)` 与默认**逐位相同**（3.655714e-07），只有 `Parameters(charge=3.0)` 生效（3.290142e-06，恰 ×9）；`Trajectory(mass=5.0)` 同样无效。`Trajectory.local_energy()` 全包无人调用。
-
-后果：阶段 D 的单位适配器若按 README 把电荷放在轨迹上，会**静默按 $q=1$ 计算**。与 BUG-1（`recoil` 静默忽略）同型。
-
-**修复**：选择"单一事实来源"而不是"让死字段生效"——`Trajectory` 的 `mass`/`charge` 字段与 `as_trajectory` 的对应参数已**删除**（`local_energy()` 的在壳回退随之改为 `gamma()`，自然单位下 $m_e=1$）。原来的写法留了两个能设电荷的地方，正是产生这个陷阱的原因；现在写在轨迹上会立刻 `TypeError`。`README §6.1` 同步说明。新增 `test_trajectory_carries_no_inert_mass_or_charge`（含 `Parameters.charge` 的 $q^2$ 比率验证）。
-
-#### 次级（输入校验缺失，2026-09-12）✅ 已全部修复
-
-- ✅ **`Trajectory` 不校验 `time` 严格递增**：`as_trajectory` 校验（[trajectory.py:45](lambdapic/src/lambdapic/core/qed/baier_katkov/trajectory.py#L45)），`Trajectory` 直接构造不校验。实测非单调时间被接受，`trapz_weights` 返回乱权重（`[0.1,0.05,0.05,0.15,0.05]`），谱给出**貌似合理的错值**而不报错。README §7 与示例都直接构造 `Trajectory`。→ 校验下沉到 `Trajectory.__post_init__`（报出具体是哪一对样本违反），`as_trajectory` 改为纯转发。
-- ✅ **有限性只对 `energy` 校验**：`position`/`momentum`/`time` 里一个 NaN 被接受，整条谱变 NaN，且 `SamplingWarning` 与 `RecordLengthWarning` **都不触发**（NaN 比较为 False，`np.any(nan >= 1)` 为假）——完全静默。PIC 里的丢失粒子会产生这种记录。→ `time`/`position`/`momentum` 全部加有限性校验。
-- ✅ **`split` 非法时静默退回单板，metadata 照记**：`cone_directions` 在 `not 0 < split < theta_max` 时丢弃 `split`/`n_inner`（[integrator.py:770](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L770)），但 `compute_spectrum` 仍写 `metadata["theta_split"]`（[integrator.py:1367](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L1367)）。实测 `split=5.0, theta_max=1.0` 返回单板 4 方向，而 metadata 报 `theta_split=5.0, n_inner=8`——**metadata 描述了没被使用的网格**。`compute_spectrum(..., n_inner=…)` 不带 `split` 时同样被静默忽略。→ 新增 `cone_bands` 作为两板规则的唯一事实来源：`split`/`n_inner` 必须成对、`split` 必须落在 $(0,\theta_{max})$，否则 `ValueError`；metadata 改记 `cone_bands` 的**实际**结果。
-- ✅ **size-1 数组 `omega` 抛 TypeError**（numpy ≥ 2）：`double_time_integral` 的 `omega = float(omega)`（[integrator.py:650](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L650)）对 `np.array([0.5])` 抛 `TypeError: only 0-dimensional arrays can be converted to Python scalars`；标量与 0-d 数组正常，batch 路径（`np.atleast_1d`）正常。逐点迭代 `grid[i:i+1]` 的调用方会撞上，numpy 1.x 下曾可用。→ 新增 `_as_scalar_omega`（接受标量/0 维/size-1 数组，尺寸 >1 报错），三个单点入口统一走它。
-
-#### 文档与验证债（2026-09-12）
-
-- **`kernel.airy_identity` 无人调用、零测试覆盖**：它在 `__all__` 里、被 README §6.4 与 docstring 说成"仅用于 validation V1"，但全树 grep 无调用者——`validation.check_airy_identity` 是**另一个函数**，公式内联重推（[validation.py:66](lambdapic/src/lambdapic/core/qed/baier_katkov/validation.py#L66)）。公开 API 与测试各自演化的典型入口。
-- **V5 文档说过头**：docstring/README §6.9 说直线记录上"BK ≈ LW"，实测 `BK=-2.83e-07` vs `LW=+1.86e-04`，比值 $1.5\times10^{-3}$，**两者并不一致**。物理无问题（dot 核的真空减除消掉直线项，有限记录 LW 振幅不消），是那句文档描述错误。
-- **`test_record_adequacy_tracks_the_open_arc_deficit` 没有检验它声称的物理**：三条轨迹是同一圆的 (1.0 圈,1200)、(0.5,600)、(0.25,300)——采样密度恒为 1200/圈、`_curvature_rate` 相同，故 $L/\tau_f$ 严格 $\propto$ 圈数（实测 1.5996/0.7998/0.3999），断言退化成一个阈值区间加一个构造上必然成立的单调性；docstring 里那张谱亏损表（0.89@0.9 圈 … $-0.19$@0.4 圈）**从未被执行**。
-- **`test_prefactor_constant` 是变更探测器**：断言 `PREFACTOR == fine_structure/(4π²)`，即 `integrator.py:123` 的定义式本身，不检验归一化（真正钉绝对归一化的是 V8 与 Schwinger 对照）。
-- **README §6.5 漏参数**：`BKIntegrator.__init__` 漏 `checks`，`compute_spectrum` 漏 `checks`/`split`/`n_inner`。
-- **README §8 环境整节是 Windows 旧值**（`d:/Desktop/...Scripts/python.exe`、Python 3.11、`PYTHONUTF8=1`、"C 扩展未编译"、V1–V8 约 17 s / pytest 约 10 s）；本文档第 4 行的"Python 3.11.9"同。本机实为 Linux、Python 3.12.7、C 扩展 16 个 `.so` 全编译、V1–V8 约 6 s、51 例 pytest 约 11 s。
-- **`phase.classical_phase`/`recoil_phase`/`local_recoil_phase` 不在计算路径上**：README §2.4/§6.3 把它们当作"计算所用的相位"，实际积分器用内联副本（[integrator.py:290](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L290)、328 及 numba 内核）。实测两者一致（$\le10^{-10}$），故**当前不是错误，是漂移风险**；`Parameters.epsilon_prime`/`recoil_factor` 同理未被计算使用。
-
-#### 已核查干净（负面结果，限定上条清单的边界）
-
-numpy/numba 双后端在**非均匀网格**上 × 3 核 × 2 相位 × 固定/局域能量一致到 $10^{-14}$；奇/偶 $N_t$ 配 `block ∈ {1,2,3,8,1000}` 的折行配对覆盖每行恰好一次；逐 $\omega$ 数组 `epsilon_prime`（套件未覆盖）两后端一致；局域核/相位的 numpy 与 numba 公式代数与数值同一；用文档函数（`phase.*`/`kernel.*`）独立重写的朴素 $\sum_{ij}w_iw_jNe^{-i\Phi}$ 能复现 `double_time_integral`；`kernel.trace_kernel`/`dot_kernel` 中"死"的局域分支与 `_local_vertex_arrays` 逐位一致；`trapz_weights`、`_beta_from_position`、两套方向网格的权重守恒、`_kernel_coefficients` 与核函数、`Parameters.recoil` → `(phase, epsilon_prime)` 映射均自洽。**V8 对 scipy Macdonald/Airy、V2 的精确代数恒等式、V7 的在壳恒等式、与项目 LCFA 表的交叉核对都确实独立，未发现循环论证。**
-
-#### 项目级（非代码）
-
-- **仓库位置（2026-09-14 更正）**：git 仓库在 `/home/panda/lambdapic/lambdapic`（分支 `main`），**不是**外层目录——外层 `/home/panda/lambdapic` 放的是虚拟环境、用户配置、参考书 PDF 等不入库的东西，所以在外层 `git log` 会报"不是仓库"。第二轮审查时据此误判为"无版本控制"，记录错误，此处更正。
-- **提交状态（2026-09-14）**：此前 09-11 与 09-12 两个会话的成果都只在工作区（最后一次提交是 2026-09-10 的 `253a0ac`；合并起来 10 个文件 +1703/−99，含 2 个未跟踪文件）。已按内容拆成两个提交落库：`411a63f`（09-11 的 P-3 守卫 / P-4 自适应锥角 / Test B，该快照单独跑 51 例全过）与 `2563766`（本轮的 BUG-7/8/9 与输入校验，58 例全过）。拆分方式：先整体回退本轮改动得到可验证的 09-11 快照并提交，再从备份恢复本轮状态提交——**中间态与终态各自都跑过 pytest 与 V1–V8**，用于确认回退没有过推或漏推。
-- **Test B 线能量列复现偏差**：本次复跑 $n=2,8,16$ 得 2.0029 / 7.9177 / 15.7285，本文档 §8.1 记的是 1.981 / 8.021 / 15.97（偏差 1.1–1.5%），而 §8.1 声称"$n\ge2$ 后线性到 0.2% 内"。三个主标度（$n^2$、$\Gamma$、线宽）逐位重现，只有"线能量"这个窗口积分量在 1% 量级上不可复现——不影响结论，但该行声称的精度需要下调。
-
----
-
-## 3. 文档债务：设计文档全部悬空
-
-模块中几乎所有物理公式的引用（"eq. 7.1"、"eq. 5.3"、"sec. 15"、"sec. 4.2"、"eq. 10.3"…）都指向三个不存在的文件：
-
-- `Baier-Katkov.md`（核与相位的推导、eq. 编号来源）
-- `Baier-Katkov-architecture.md`（README 声称在仓库根目录）
-- `Baier-Katkov-multiparticle.md`（路线图 sec. 15）
-
-已在 `d:\Desktop\lambdapic` 全树（排除 .venv）搜索确认这三个文件**不存在**。后果：
-
-1. 迹核/点积核的具体形式、$(\alpha/\pi)$ 前因子、$\varepsilon/\varepsilon'$ 反冲相位约定**无法独立审计**——模块的物理正确性目前只能靠 V1–V7 的内部自洽与经典极限支撑；
-2. 点积核与迹核之间存在 $O(\omega/\varepsilon)$ 的差别（前因子 $(\varepsilon^2+\varepsilon'^2)/(2\varepsilon'^2)$ vs 有效 $(\varepsilon^2+\varepsilon'^2)/(2\varepsilon\varepsilon')$，差一个因子 $\varepsilon'/\varepsilon$），**哪一个更接近真实量子谱，目前没有任何外部依据**（见 §5 物理缺口 P-1）；
-3. 新贡献者无法理解 "eq. 10.3 量子同步辐射谱" 指什么。
-
-**建议**：把设计文档（哪怕只是方程清单 + 推导要点）纳入仓库 `docs/`，或将方程编号直接内联进模块 docstring；至少为每个 eq. 引用补上文献出处（Baier–Katkov 原始论文 / Baier–Katkov–Strakhovenko 专著）。
-
-**2026-09-11 进展：已与 BKS 专著逐式核对，编号对照建立。** 用 Baier–Katkov–Strakhovenko 专著（*Electromagnetic Processes at High Energies in Oriented Single Crystals*, World Scientific）第 55–77 页（§2.2–§2.4，含 §2.1 的方法论前提）核对，确认模块公式就是该书结果，编号对照如下：
-
-| 模块 docstring 引用 | 实际出处（BKS 专著） | 内容 |
+| 模块引用 | 出处 | 内容 |
 |---|---|---|
-| eq. 5.3 / 6.1（相位） | **(2.25a)/(2.25b)**，经 (2.40) 的 $k'_\mu=k_\mu\varepsilon/(\varepsilon-\hbar\omega)$ 进入 | 反冲相位因子 $\varepsilon/\varepsilon'$ |
-| eq. 7.3（dot 核） | **(2.42) 第一式** | $[(\varepsilon^2+\varepsilon'^2)(v_1v_2-1)+\hbar^2\omega^2/\gamma^2]/(2\varepsilon'^2)$ |
-| eq. 7.1（trace 核） | **(2.42) 第二式** | $-\frac{m^2}{\varepsilon\varepsilon'}\big[1+\frac{(\varepsilon^2+\varepsilon'^2)\gamma^2(v_1-v_2)^2}{4\varepsilon\varepsilon'}\big]$ |
-| 主公式（前因子 $\alpha/4\pi^2$、$\omega^2$、双时间积分、$e^{-i\Phi}$） | **(2.40)**（能量谱）＋ (2.13) $d\mathcal E=\hbar\omega\,dw$（概率→能量） | 自旋平均/极化求和对应 (2.42) 前的 "summation over spin states of the final electron and averaging over ... initial electron" |
+| eq. 5.3 / 6.1（相位） | (2.25a)/(2.25b)，经 (2.40) 进入 | 反冲相位因子 $\varepsilon/\varepsilon'$ |
+| eq. 7.3（dot 核） | (2.42) 第一式 | $[(\varepsilon^2+\varepsilon'^2)(v_1v_2-1)+\hbar^2\omega^2/\gamma^2]/(2\varepsilon'^2)$ |
+| eq. 7.1（trace 核） | (2.42) 第二式 | $-\frac{m^2}{\varepsilon\varepsilon'}[1+\frac{(\varepsilon^2+\varepsilon'^2)\gamma^2(v_1-v_2)^2}{4\varepsilon\varepsilon'}]$ |
+| 主公式（前因子 $\alpha/4\pi^2$、$\omega^2$、双时间积分） | (2.40) + (2.13) | 能量谱与概率→能量换算 |
 
-数值核对（$m=1,\varepsilon=10,\omega=3,\mathbf v_1\!\cdot\!\mathbf v_2=0.9$，在壳）：模块 dot/trace 两核与 (2.42) 两式**逐位相等**，差 $0.00\mathrm{e}{+}00$；相位与 (2.40) 的 $\frac{\varepsilon}{\varepsilon'}(kx_2-kx_1)$ 差 $0.00\mathrm{e}{+}00$。**BUG-6 修复所补的 $\varepsilon/\varepsilon'$ 因子，正是使 trace 核回到 (2.42) 的关键**（修复前系数 $(\varepsilon^2+\varepsilon'^2)/(4\varepsilon\varepsilon')$ 与专著不符）。
-
-三处**方法差异**（均非错误，需明确记录）：
-
-1. **局域能量 P-2 超出专著范围**：专著 §2.3 处理非定常场时只保留 (2.33) T-指数展开的**首项** (2.34)，即"能量在形成长度内视为常数"，相位仍用单一 $\varepsilon$；本模块 P-2 用逐顶点 $\varepsilon_i,\varepsilon'_i$ 的对称化形式，是**超出该近似的推广**（专著适用域内两者一致）。这解释了为何 P-2 只能"由对称化推导、靠测试钉死"——它本就不在专著里。**（2026-09-16 补：这句"靠测试钉死"当时没兑现——那批测试全是相盲的自洽检查，错误相位照样全过；见 §4 P-2 的更正与 §8.5 BUG-10。）**
-2. **角度积分路线不同**：专著用超相对论小角展开 (2.43)–(2.45) 解析积掉发射角，经高斯积分 (2.47) 得 (2.46)；本模块保留完整角依赖、按锥面 Gauss–Legendre **数值**积分（README §3.4）。物理等价，模块更通用但不利用专著的小角约化。
-3. **未实现自旋/极化分辨**：专著 (2.39)/(2.41) 给出含自旋密度矩阵与光子极化矢量 $e$ 的分辨核；模块只实现求和/平均后的 (2.42)（`spin_averaged`/`polarization_summed` 固定 True）。模块已声明此限制。
-
-`eq. 9.6`（Airy 恒等式）不在 p.55–77 范围内，尚未核对出处。
+数值核对逐位相等（差 $0.00\mathrm{e}{+}00$）。**三处方法差异**（均非错误）：(1) P-2 局域能量超出专著范围（专著只保留形成长度内能量常数）；(2) 专著用小角展开解析积掉发射角，本模块保留完整角依赖做数值锥积分；(3) 未实现自旋／极化分辨。
 
 ---
 
-## 4. 物理层面的问题（影响 PIC 应用的关键项）
+## 6. 与主模拟的集成
 
-### P-1：量子项（反冲/ω² 项）从未被独立验证 ✅ 已解决（2026-09-08，validation V8）
+### 6.1 已闭环的部分
 
-原状：V3/V4 只在 $\omega/\varepsilon \to 0$ 软光子区验证了经典极限；点积核中的 $\omega^2/\gamma^2$ 项、反冲相位因子 $\varepsilon/\varepsilon'$、前因子 $(\varepsilon^2+\varepsilon'^2)/(2\varepsilon'^2)$ 从未对照量子同步辐射谱验证过——而量子反冲恰恰是这个模块相对 LCFA 的核心卖点。
+主模拟内部是 **SI 单位**，BK 模块是 Compton 单位；`units.si_to_natural` 覆盖 t/x/E/ω 与 $p\to u$。
 
-**结果**（[reference.py](lambdapic/src/lambdapic/core/qed/baier_katkov/reference.py) + `validation.check_quantum_synchrotron`，公式与对接方式见 §7-B）：
+- **`trajectory.as_trajectory_si(t_si, x_si, u, energy=None, n_samples=None)`**：单位适配器。$u$ 透传不换算（它已是 PIC 存的 `ux,uy,uz`）；**变能量记录必须传 `energy`**，否则静默按固定 $\varepsilon$ 评估（§3.3）。
+- **`callback/trajectory.py` 的 `TrajectoryRecorder`**：挂 `start` 阶段，按 `_id` 追踪选中粒子（含跨 rank 迁移），写 NaN 填充的定形 npz。**移动窗口会在运行中新建粒子**，末态最热电子可能只有最后几百步历史——要全程记录就关掉移动窗口，或把盒子开到脉冲不出界。
+- **双时间积分不需要插值／重采样**：梯形权重支持非均匀网格，PIC 的时间网格可直接用（将来若走 FFT 路径才需重采样到均匀）。
+- 集成点是 `_push_position_1`/`_interpolator` 之后与 `radiation` 之后，`@callback(stage=...)` 是自然挂载点。
 
-| $\gamma$ | $\chi$ | $\delta=\omega/\varepsilon$ | 量子/经典 | BK(dot)/精确 |
-|---|---|---|---|---|
-| 10 | 0.1 | 0.02 – 0.3 | 0.98 → 0.38 | 0.999 – 1.001 |
-| 10 | 0.5 | 0.05 – 0.5 | 0.96 → 0.44 | 0.997 – 1.001 |
-| 10 | 2.0 | 0.05 – 0.7 | 0.97 → 0.54 | 0.988 – 1.001 |
-| 20 | 0.5 | 0.05 – 0.5 | 0.96 → 0.44 | 0.9993 – 1.0002 |
+### 6.2 两种用法
 
-$\gamma$ 从 10 到 20 时残差由 0.3% 降到 0.07%，符合参照公式本身的 $O(1/\gamma^2)$ 精度；角度网格 (24,8) 与 (48,16)、$N_t$ 6000 与 12000 结果到 4 位相同（已收敛）。**反冲相位、前因子、$\omega^2/\gamma^2$ 项全部正确**；同时发现并修正了 trace 核抄写错误（BUG-6）。参照公式本身经三重锚定：Macdonald 形式 ≡ Airy 形式 ≡ 项目 LCFA 表 `gen_photon_prob_rate_for_delta`（≤ 5.5e-6）；$\chi\to0$ → Schwinger 谱；经典功率 ≡ Larmor，量子功率/Larmor 与 BKS 拟合 $g(\chi)$ 相符（≤ 1.4%）。
+- **离线后处理（推荐先做）**：跑一次无反冲 PIC（关 radiation），录轨迹，BK 出谱——用于研究低 $\omega$ 红外区、形成长度效应、离散谐波结构。
+- **在线事件模式（高级）**：从 BK 微分速率构造光学深度采样器替换 LCFA 表。**注意 BK 是非局域理论**，直接采样需要"形成长度内局域化"近似；多数代码保留 LCFA 事件生成，BK 只做谱后处理与表校准。
 
-### P-2：固定入射能量 ε —— 对 PIC 轨迹不成立 ✅ 已解决 2026-09-09
+**代价**：$N_t\approx4096$、50 ω × 32 方向 → 单粒子约 20 s；$O(N_t^2)$ 不变，带状截断已判不做（§3.5）。
 
-整条轨迹使用单一 $\varepsilon$（`Parameters.epsilon`），$N(t_1,t_2)$ 和 $\Phi$ 均如此。PIC 中电子能量沿轨迹随激光场振荡并因辐射损失变化，正确形式是局部能量 $\varepsilon(t_1), \varepsilon(t_2)$（模块自认"sec. 4.2"）。对激光尾场加速（能量变化 $O(1)$）或长记录，固定 ε 会同时错相位和核。
+### 6.3 未做
 
-**已实现**：`Trajectory.energy` 可选字段（逐采样 `eps(t)`，正数校验），`Trajectory.local_energy()` 从动量历史恢复 `eps = m·γ`。核与相位切换到逐顶点形式（`kernel.py` 的 `epsilon2` 关键字 + `integrator.py` 的 `energy=` 入口，numpy/numba 双后端）：
-
-- 相位 $\Phi_{ij}=\omega\left[f_j(t_j-\mathbf n\cdot\mathbf r_j)-f_i(t_i-\mathbf n\cdot\mathbf r_i)\right]$，$f_i=\varepsilon_i/\varepsilon'_i$，用差分稳定形式 $\Phi=\omega[\bar f\,\Delta x + \Delta f\,\bar x]$ 求值（$\bar f$、$\Delta f$ 为逐对平均/差，$x=t-\mathbf n\cdot\mathbf r$），能量变化只经小项 $\Delta f$ 进入，保留反演反对称性 → 厄米上三角求和仍成立。
-- 迹核（基本形式）：$N_{ij}=(A_i+A_j)+(B_i+B_j)(\mathbf b_i\cdot\mathbf b_j-1)$，$A_i=-\frac{m^2}{2\varepsilon_i\varepsilon'_i}+\frac{m^2 c_i}{4\varepsilon_i^2}$，$B_i=\frac{c_i}{4}$，$c_i=\frac{\varepsilon_i^2+\varepsilon_i'^2}{\varepsilon_i'^2}$。
-
-**关键发现**：逐顶点反冲 $\varepsilon'_i=\varepsilon_i-\omega$ 下，在壳恒等式 $(\varepsilon_i-\varepsilon'_i)^2=\omega^2$ **逐顶点成立**，故对称化的局域 dot 与 trace 核**严格重合**（回归测试到 $10^{-10}$）。即 kernel.py 文档旧预期"ε1≠ε2 时两核不同"只在一个固定全局 $\varepsilon'$ 的约定下成立；本项目采用 roadmap 的逐顶点 $\varepsilon'_i=\varepsilon_i-\omega$ 约定，两核合一。经典模式（$\varepsilon'_i=\varepsilon_i$，$f=1$）则完全不含能量历史（trace 退化为纯 $\mathbf b_1\cdot\mathbf b_2-1$），已作为"能量无关性"测试固定。**注**：sec. 4.2 局部形式因 `Baier-Katkov.md` 缺失（§3 文档债）而由对称化推导并靠测试钉死（恒能量退化 ≡ 固定路径到 $10^{-16}$；能量变化轨道上谱正性、厄米性、numba≡numpy 到 $10^{-11}$）。
-
-pytest 新增 8 个用例（12 个参数化实例）：`test_local_energy_degenerates_to_fixed`、`_kernels_coincide_on_shell`、`_matches_numpy`、`_is_hermitian`、`_spectrum_positive`、`_classical_is_energy_independent`、`_validation`。固定路径未动，23 例原回归 + 35 例全量 + V1–V8 全部通过。
-
-> ⚠️ **2026-09-16 更正（BUG-10，详见 §8.5）：本节的"已解决"当时是空头支票，两条论据都被推翻。**
->
-> **(1) 上面的相位写法不成立。** $\Phi_{ij}=\omega[f_jx_j-f_ix_i]$ 与它的"差分稳定形式" $\omega[\bar f\Delta x+\Delta f\bar x]$ 在 $f$ 变化时**都不是平移不变的**：$\bar x$ 就是**绝对**光锥坐标，$\Delta f$ 项带坐标原点（$x\to x+c$ 给 $\Phi$ 加 $\omega c(f_j-f_i)$）。实测：把记录平移 $(+5000,+300\hat{\mathbf x})$，$\omega=0.2$ 处 $d_2E$ 从 3696.7 变到 9005.4（140%），固定能量路径则逐位不变。"能量变化只进入小量 $\Delta f$ 项，不会被大数相减吞掉"这句话因此是**反的**——小项乘的是大数。现改为路径积分 $\Phi_{ij}=\omega[(T_j-T_i)-\mathbf n\cdot(\mathbf R_j-\mathbf R_i)]$（逐 $(\omega,\mathbf n)$ 累积表 `phase.local_phase_tables`），平移不变、$f$ 为常数时**精确**退化到固定形式；`local_recoil_phase` 的两点形式只在 $f$ 恒定时有效，传变动的 $f$ 现在**直接报错**（`test_local_recoil_phase_rejects_a_varying_factor`）。
->
-> **(2) 上一条列出的 7 个用例没有一个是相位的绝对判据**，所以它们全都"通过"却什么也没钉住：恒能量（`_degenerates_to_fixed`）与经典模式（$f\equiv1$，`_classical_is_energy_independent`）下错误相位与正确相位**逐位相同**；`_kernels_coincide_on_shell`、`_is_hermitian`、`_spectrum_positive`、`_matches_numpy` 是对**任意反对称相位**都成立的自洽恒等式（两后端还同错）；`_validation` 只是输入校验。判别性判据是**平移不变**，不是任何内部自洽——修复当天补的 `test_local_energy_phase_is_translation_invariant` 正是它。教训与 §8.2/§8.3 同一条：**自洽性测试不能替代外部判据**。
->
-> 结论：P-2 的"已实现"自 2026-09-16 起才成立；2026-09-09 至 09-16 之间，任何在**变能量**轨迹上跑的局域模式结果都不可信。所幸这段窗口内没有产生过依赖局域相位的物理结论——`banding.py` 对带 `energy` 的轨迹直接抛错，§8.2/§8.3 的截断实验与 V1–V8 都走固定 $\varepsilon$，§8.4 的 LWFA 检查用的是 `as_trajectory_si(..., u=u)`（**没传 energy**，静默走固定 $\varepsilon$，这也正是 §8.3(g)#5 记的那条缺陷）。
-
-### P-3：有限记录 —— 已重新诊断（2026-09-11），守卫已加，物理修正未做
-
-> 原诊断（"硬截断端点辐射污染整个谱"，例：闭合圆环 $\omega/\varepsilon=0.5$ 处 $\mathrm dW/\mathrm d\omega=-4922$）**经复核不成立**。以下为实测结论（环境：Python 3.12 venv；脚本见对话记录）。
-
-**(a) $-4922$ 是采样混叠，不是边界项。** 闭合圆环、$\gamma=10,\chi=0.5$（$\rho=198$）、$\delta=0.5$ 处反冲移动谐波 $m\approx1990$，Nyquist 判据要求 $N_t>4m=7960$。实测 $\mathrm dE/\mathrm d\omega$ 与精确值之比：
-
-| $N_t$ | 512 | 2000 | 3980（$=2m$） | 7960（$=4m$） | 15920 |
-|---|---|---|---|---|---|
-| 比值 | **2126** | **−82** | 2.16 | **1.0007** | 1.0007 |
-
-充分采样后闭环在该频率**没有**边界问题（V8 通过用的正是 $N_t=7960$）。原 $-4922$ 用的是 V6 的 $N_t=512$，欠采样 8 倍。**附带修正**：V8 docstring 的判据 $N_t>2m$ 偏松一倍（只允许每振荡一个采样点，$N_t=2m$ 实测仍差 116%）；正确判据是 $N_t>4m$。
-
-**(b) 真正的失败模式在低 $\omega$／记录短于形成时间，且局域在端点。** 不欠采样、用同一二维角度网格对比"开弧 vs 整圈"（圆、一次谐波，比值相对 $L\,\mathrm dP/\mathrm d\omega$）：
-
-| $L/\tau_f$ | 1.60（闭环） | 1.44 | 1.28 | 1.12 | 0.96 | 0.80 | 0.64 |
-|---|---|---|---|---|---|---|---|
-| 比值 | 1.000 | 0.886 | 0.719 | 0.480 | 0.209 | **−0.032** | **−0.187** |
-
-**整数圈精确**（2.00 圈→2.000，3.00 圈→3.000），**非整数圈按缺失的偏圈亏损**（1.25 圈多出的 1/4 圈只贡献 0.1645＝额定的 66%，与独立 1/4 弧的 61% 吻合）。亏损**局域在记录两端的 $\sim\tau_f$ 邻域**，不是"污染整个谱"。$\tau_f=\big(6\varepsilon'/(\omega\Omega_{\rm eff}^2)\big)^{1/3}$ 随 $\omega$ 减小而增大——低 $\omega$ 最严重，恰是本模块承诺的软光子区。直线记录 $\Omega_{\rm eff}=0\Rightarrow\tau_f=\infty$（判据不适用，真空减除已消去直线部分）。
-
-**(c) 形成长度窗口（原文"首选"）不是它的解。** 窗口把被积函数乘以 $\le1$ 的因子，而有限记录下的自然权重是 $(L-|\tau|)$，窗口只会进一步削减积分。实测：$\tau_w=100$ 把 $\delta=0.5$ 的 $-62.8$ 压到 $-0.057$（好），但同时把一次谐波的 $+4.10$ 压到 $-0.139$（**杀掉物理信号**）。窗口的正确定位是性能（带状截断，§5）与非均匀场退相干建模。
-
-**已实现（2026-09-11）**：两个运行时守卫，所有入口默认 `checks="warn"`（可 `"raise"`/`"ignore"`）——`SamplingWarning`（`sampling_margin ≥ 1`，Nyquist）与 `RecordLengthWarning`（`L/\tau_f < 1.5`）；`BKIntegrator.adequacy()` 与 `Spectrum.metadata` 给出逐 $\omega$ 数值。V1–V8 数值逐位不变，回归 35→40 例全过。
-
-**未做**：端点亏损的物理修正。前置问题：$L\lesssim\tau_f$ 时"弧长×常数场辐射率"**本身就不是正确靶值**，需先做收敛性研究定靶，再考虑端点渐近延拓或 $(L-|\tau|)$ 权重尾部修正。
-
-**(d) 收敛性研究（2026-09-11）：$\tau_f/L$ 标度**未获证实**，且该问题在可用测试台上是**提法不成立**的。**
-
-原计划是在一条非周期轨迹上量"亏损 vs $L$"，验证 $\text{deficit}=c/L$。实测结论：
-
-1. **在锐谱线处 $d\mathrm E/d\omega \propto L^2$**，与 $\Delta t$ 无关（每圈 80/200/400 采样给出逐位相同结果，margin 0.05→0.01），整数圈与非整数圈皆然。这是**正确的物理**（谱线：振幅 $\propto L$，密度 $\propto L^2$；线宽 $\propto1/L$，故线能量 $\propto L$）。后果：`reference.py` 里"一圈 $d\mathrm E/d\omega$ = 连续谱密度 $T\,\mathrm dP/\mathrm d\omega$"的对应**只对一圈成立**；对多圈记录拿 $L\cdot\mathrm dP/\mathrm d\omega$ 作靶是**范畴错误**——我最初的"亏损表"正是踩了这个坑。**后续认识（2026-09-11，见 [§8.1](#81-圈间相干一个已经测到但当时标错了名的-lcfa-判别信号2026-09-11)）**：同一个 $L^2$ 标度换到"BK vs LCFA"的视角下，就是**圈间相干的直接观测**——LCFA 管线（局域速率、蒙卡事件无相位）给不出它，定量预言是"$n$ 圈时谱线中心密度／LCFA 连续谱密度 $=n$"。同一条物理，当时按记账问题记下了。
-2. **换到真正宽带（chirped）轨迹后**（$\Omega(t)=\Omega_0(1+0.5\sin(\omega_s t))$，慢调制，$\chi\in[0.5,0.75]$，用绝热靶 $\int_0^L\mathrm dP/\mathrm d\omega(\chi(t))\mathrm dt$），$d\mathrm E/\mathrm d\omega \propto L^{1.07}$（确为线性，无 $L^2$），但**亏损不服从 $c/L$**：
-
-   | $L/\tau_f$ | 2.42 | 4.84 | 7.27 | 9.70 | 12.13 | 14.55 | 19.41 | 24.26 |
-   |---|---|---|---|---|---|---|---|---|
-   | deficit | 0.143 | −0.078 | 0.089 | −0.062 | 0.087 | 0.198 | −0.025 | −0.003 |
-   | $\text{deficit}\cdot L/\tau_f$ | 0.35 | −0.38 | 0.65 | −0.60 | 1.05 | 2.87 | −0.48 | −0.08 |
-
-   亏损**变号**（有时过冲），且 $\text{deficit}\cdot L/\tau_f$ 在 $-0.6$ 到 $2.9$ 之间游走，**不是常数**。主导 $L$ 依赖的是谱分辨率/相干结构，不是光滑的 $c/L$ 尾巴。
-3. 唯一稳健、可复现的现象仍是最初那条：**$L\lesssim\tau_f$ 时谱塌缩（可变负）**——守卫的 1.5 阈值正是据实测塌缩边界定的，不依赖任何标度模型。
-
-**结论**：**不要基于 $c/L$ 模型做端点修正**。若要继续，需要一条真正非重复（宽带/随机或真实 PIC）轨迹，且靶值必须由 $L\to\infty$ 收敛性定义，而不是解析速率；在拿到那种测试台之前，守卫（已实现）是恰当的终点。
-
-### P-4：默认锥角 —— 已解决（2026-09-11），且**原文的方向判断有误**
-
-> 原文："BK 的特征发射角随光子能量按 $(\varepsilon/\varepsilon')\,/\gamma$ 展宽（ω→ε 时发散）；默认固定锥 $5/\gamma$ 对**高 $\omega$** 会系统性低估角度积分。"**这两句都不成立。**以下为实测（$\gamma=10,\chi=0.5$ 圆、整数反冲移动谐波、BK 核、收敛角网格）。
-
-**(a) 发射半角在低 $\omega$ 处变宽，方向与原文相反。** 相位角向项的驻相标度给出
-
-$$\theta_c=\Big(\frac{4\varepsilon'\Omega_{\rm eff}}{\omega\varepsilon}\Big)^{1/3}=\Big(\frac{4}{m}\Big)^{1/3},\qquad m=\frac{\omega\varepsilon}{\varepsilon'\Omega_{\rm eff}},$$
-
-实测半能角 $\approx0.35\,\theta_c$，且 $\theta_{50}\gamma m^{1/3}=4.6$–$6.2$ 在 $\delta=0.02$–$0.7$ 内近似恒定（$m^{-1/3}$ 标度成立）：
-
-| $\delta$ | 0.02 | 0.05 | 0.10 | 0.20 | 0.30 | 0.50 | 0.70 |
-|---|---|---|---|---|---|---|---|
-| $\theta_c\gamma$ | 4.62 | 3.37 | 2.62 | 2.00 | 1.67 | 1.26 | 0.95 |
-| $\theta_{50}\gamma$（实测） | 1.79 | 1.26 | 0.98 | 0.70 | 0.60 | 0.37 | 0.33 |
-
-即**软光子端锥最宽**（$\delta=0.02$ 处 $\theta_c\approx4.6/\gamma$），而 $5/\gamma$ 在 $\delta\gtrsim0.5$ 处反而宽裕。被截掉的正是本模块承诺的软光子区（§8.1）。
-
-**(b) 第二个、独立得多的原因：速度摆幅。** 角积分绕**固定轴**（默认 $\beta(0)$）做锥面积分，但记录上每一段辐射都绕**瞬时**速度方向。发射方向最远到 $\text{swing}+\theta_c$，其中 $\text{swing}=\max_t\angle(\boldsymbol\beta(t),\boldsymbol\beta(0))$——闭环轨道是 $2\pi$，固定锥只捕到约 1%。**任何固定小锥都无效**，与 $\omega$ 无关。
-
-**(c) 实测总账**（$\gamma=5,\chi=0.5$、$0.75$ rad 弧、$N_t=2\times10^4$、经典 LW 角分布 + 二维 $96\times48$ 收敛参考；LW 的角结构与 BK 相同——核不依赖 $\mathbf n$，$\mathbf n$ 只进相位）：
-
-| $\delta$ | $\theta_c\gamma$ | 自适应 $\theta_{max}$ | 旧默认 $5/\gamma$ | 新默认（自适应 + 两板） |
-|---|---|---|---|---|
-| 0.10 | 2.64 | 2.333 | **−99.69%** | −0.79% |
-| 0.30 | 1.68 | 1.760 | **−92.92%** | −1.02% |
-| 0.50 | 1.27 | 1.511 | **−91.19%** | −1.58% |
-
-**(d) 已实现（2026-09-11）**：
-
-1. `integrator.default_theta_max` $=\min(\pi,\ \text{swing}+3\max_\omega\theta_c)$，下限为历史 $5/\gamma$（**绝不比过去更紧**）；`theta_max=None` 时由 `compute_spectrum` 自动使用。取 $\omega$ 网格上的最大值，是为了保住"一份方向网格在频率间共享"的 numba 批处理路径。
-2. `cone_directions` 增加**两板**选项（`split`/`n_inner`）：$1/\gamma$ 内芯单独用一组 Gauss–Legendre。这是**必需**而非优化——单板跨全空间时 $n_\theta=16$ 在 $\delta=0.5$ 处角积分错 **97%**、$n_\theta=32$ 仍错 13%，要到 $n_\theta\approx64$ 才收敛；分板后 $24+8$ 个节点即与收敛值逐位相同。
-3. 第三个运行时守卫 `AngularConvergenceWarning`（默认 `checks="warn"`）：把 `n_theta`/`n_phi`/内板节点数加倍，在**承载谱量最多**的 $n_{probe}$ 个频率上重算角积分（按 $|\mathrm dE/\mathrm d\omega|$ 选点），**相对峰值**的变化 $>2\%$（`ANGULAR_RTOL`）即报警；开销约 $4n_{probe}/N_\omega$。阈值与实测精度边界吻合（$\gamma=5,\chi=0.5$、$\delta=0.3$、`axis=z`：$n_\theta=12$ → 角积分高 4.6% → 报警；$n_\theta=16$ → 高 0.0% → 静默）。**探针与判据在 2026-09-11 改过**：最初是"min/median/max 三点 + 逐点相对"，在 Test B（闭环线谱）上被线间相消残差带出 $>140\%$ 的**误报**（线中心只动 $1.9\times10^{-5}$），故改为"权重最大探针 + 峰值相对"。已知局限见 README §3.7（线谱需由驱动器自带针对线中心的检查）。另有**免费**诊断 `metadata["angular_edge_fraction"]`（最外层节点承担的份额）及 `["velocity_swing"]`、`["emission_half_angle"]`。
-4. **V1–V8 数值逐位不变**，回归 40→48 例全过。原因：自适应与两板都只在 `theta_max=None` 的默认路径启用；显式传 `theta_max` 的调用（全部验证与示例都是如此）走历史单板路径。
-
-**(e) 边界（诚实记录，未做）**：固定轴锥面只在**摆幅远小于锥角**时有效。闭环轨道（发射是绕轴的环）即使自适应锥开到 $\pi$、$n_\theta=16$ 也不收敛（$\mathrm dE/\mathrm d\omega$ 是精确值的 2.39 倍），此时须显式传 `axis=`（对称轴/束轴，如 V6 传 `axis=[0,0,1]`）或更大的 `n_theta`。新守卫会**报警**而不是静默返回错值（旧默认在此情形下静默返回约 1% 的量）。要根治需要沿速度路径自适应布置方向网格，属于新方法而非参数调整。
-
-**方法论附带发现**：角积分的收敛性研究**必须在整数反冲移动谐波上做**。用非整数 $m$ 时闭合轨道出现端点项，角积分看起来随节点数乱跳、不收敛（实测：$m=852.8$、$N_t=6823$ 时 $n_\theta$ 从 8 增到 128 结果在 $\pm20\%$ 间振荡；换成整数 $m=853$ 后 $n_\theta\ge24$ 即收敛到 1e-5）。
+多轨迹批量（共享 $\omega/\mathbf n$ 网格）、系综加权加法器、CI 冒烟测试。
 
 ---
 
-## 5. 性能现状与优化方向
+## 7. 历史缺陷与教训
 
-**2026-09-08 起 [integrator.py](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py) 提供双后端**：`"numpy"`（分块外积参考路径，保留为真值）与 `"numba"`（默认；`@njit(parallel=True, cache=True)`，显式利用 $K(t_2,t_1)=K(t_1,t_2)^*$ 只算上三角，并把一个谱的全部 $(\omega,\mathbf n)$ 对合并为对 $(t_1,t_2)$ 的一次遍历——核在方向间共享、相位宗量在频率间共享；行按 $i \leftrightarrow N_t-1-i$ 折叠配对以平衡 prange 负载）。两后端对三种核 × 两种相位一致到尺度相对 $\lesssim 10^{-14}$。
+### 7.1 缺陷表（完整叙事见各提交）
 
-实测（16 线程）：
-
-| 配置 | numpy | numba |
-|---|---|---|
-| 示例：$N_t=512$，8 ω × 16 方向 | 4.2 s | **0.03 s**（约 140×） |
-| $N_t=4000$，4 ω × 16 方向 | — | 0.83 s ≈ 0.62 G(对×组合)/s |
-| validation V1–V7 全套 | ~60 s | **1.3 s** |
-| 首次编译（之后走磁盘缓存） | — | ~3.7 s |
-
-外推：PIC 轨迹 $N_t\approx4096$、50 ω × 32 方向 → 单粒子约 **20 s**（修复前估算 1.7 小时）；§7-B 的量子同步辐射交叉验证（$\gamma=10$、$N_t=2\times10^4$、15 ω × 16 方向）约 80 s，已可行。
-
-仍是 $O(N_t^2 N_\omega N_{dir})$——numba 只是同一方法的快速求值，不改变标度。后续按性价比：
-
-1. ~~**形成长度带状截断**（复杂度降到 $O(N_t\,N_\omega)$）：只对 $|t_2-t_1| \lesssim 2 l_f(\omega)$ 的带内求和——现在是最大的**性能**杠杆。注意它**不是 P-3 的解**（§4）：窗口只会进一步削减积分、加重端点亏损；它解决的是代价。~~ ⛔ **2026-09-14 判定不做**，见 §8.2：判据实验显示被积函数的滞后分布不衰减，截断掉的是相消项而非尾巴，在闭合与非周期两种记录上都不收敛。当前最大的性能杠杆改为**周期性分块**（仅适用于封闭/准周期轨迹）。
-2. **FFT/NUFFT**（远期）：固定 ε 时相位是 $e^{if(\omega,\mathbf n)(t_2-t_1)}e^{ig(\omega,\mathbf n)\cdot\Delta\mathbf r}$ 结构，单时间谱可用 NUFFT 降到 $O(N_t\log N_t)$，但核 $N(t_1,t_2)$ 非可分（含 $\boldsymbol\beta_1\cdot\boldsymbol\beta_2$），需低秩/多项式展开才能完全 FFT 化。
-
----
-
-## 6. 与主模拟的集成点（已勘察）
-
-主模拟内部是 **SI 单位**（场 $E_0 = a_0 m_e c \omega_0/e$，见 [laser.py:339](lambdapic/src/lambdapic/callback/laser.py#L339)；χ 计算用 SI 常数，见 [inline.py:5-13](lambdapic/src/lambdapic/core/qed/inline.py#L5-L13)）。而 BK 模块是 Compton 单位。`units.si_to_natural` 已覆盖 t/x/E/ω 与 $p \to u$ 的换算，**单位桥已具备**，缺的是一个把 Simulation 数据流式转成 `Trajectory` 的适配器。
-
-关键集成点（[simulation.py](lambdapic/src/lambdapic/simulation/simulation.py) 的 run 循环）：
-
-| 阶段 | 用途 |
-|---|---|
-| `_push_position_1` / `_interpolator` 之后 | 每步读取 $x,y,u_x,u_y,u_z$（SI + 归一化动量），记录轨迹样本 |
-| `radiation`（`update_chi()` + `event()`）之后 | 读取 χ、δ、event，用于 BK/LCFA 对照与事件标记 |
-| callback 机制 `@callback(stage=...)` | 轨迹记录器/谱累加器的自然挂载点 |
-
-颗粒数据（[particles.py](lambdapic/src/lambdapic/core/particles.py)）已具备集成所需的全部字段：`x,y,z`（SI）、`w`（宏粒子权重）、`ux,uy,uz`（= $u=\gamma\beta$，与 `Trajectory.momentum` 约定一致）、`_id`（64 位稳定粒子 ID，跨 patch/MPI 追踪轨迹必需）。MPI 下按 rank 收集、按 `_id` 归并即可。
-
-**双时间积分不需要插值/重采样**——梯形权重支持非均匀网格（[integrator.py:45](lambdapic/src/lambdapic/core/qed/baier_katkov/integrator.py#L45)），PIC 步进的时间网格可直接使用；但若将来走 FFT 路径，则需 `linear_interpolate` 重采样到均匀网格。
-
----
-
-## 7. 路线图：从参考实现到完整 PIC 模拟
-
-### 阶段 A — 修复与文档补全（先做，1–2 天）
-
-1. ✅ 修 BUG-1 ~ BUG-5（§2）；
-2. 把 `Baier-Katkov.md` 的方程清单与推导要点补进仓库（至少为每个 eq. 引用补文献出处），或删除悬空引用；
-3. ✅ pytest 回归 [tests/test_baier_katkov.py](lambdapic/tests/test_baier_katkov.py)：numba≡numpy、虚部、$|A|^2$ 恒等式、Schwinger 绝对归一化、`recoil` 选项生效、谱自洽、非法输入拒绝（13 例，约 4 s）。
-
-### 阶段 B — 物理验证闭环（核心，决定模块可信度）
-
-4. ✅ **P-1 量子同步辐射交叉验证**（2026-09-08 完成：`reference.py` + validation V8 + pytest `test_quantum_synchrotron_*`；结果见 §4 P-1）。参照物是**恒定场量子同步辐射谱**（Sokolov–Ternov / Baier–Katkov 1967 / Ritus 1985，也就是 LCFA 速率），且正是项目 LCFA 表 [`gen_photon_prob_rate_for_delta`](lambdapic/src/lambdapic/core/qed/optical_depth_tables.py#L124-L131) 所用的公式——它是同一理论在恒定场中把双时间积分解析做完的结果，所以检验的是**实现**（前因子、反冲相位、$\omega^2/\gamma^2$ 项、dot/trace 谁对）而非理论；圆轨道上场沿轨迹严格恒定，LCFA 精确成立，对照没有模糊地带。模块单位制（$c=\hbar=m_e=1$，$\varepsilon=\gamma$）下，记 $\chi=\gamma^2\beta^2/\rho$，$\delta=\omega/\varepsilon$，$y=\dfrac{2\delta}{3\chi(1-\delta)}$，单位实验室时间的光子数谱为
-
-$$\frac{dW}{dt\,d\delta} = \frac{\alpha}{\sqrt3\,\pi\,\varepsilon}\left[\left(1-\delta+\frac{1}{1-\delta}\right)K_{2/3}(y) - \int_y^\infty K_{1/3}(x)\,dx\right],\qquad \frac{dP}{d\omega}=\frac{\omega}{\varepsilon}\frac{dW}{dt\,d\delta}$$
-
-   等价的 Airy 形式（项目表所用；$z=[\delta/(\chi(1-\delta))]^{2/3}$，$y=\tfrac23 z^{3/2}$）：$\dfrac{dW}{dt\,d\delta}=-\dfrac{\alpha}{\varepsilon}\left[\displaystyle\int_z^\infty\!\mathrm{Ai}(x)dx+\left(\frac2z+\delta\chi\sqrt z\right)\mathrm{Ai}'(z)\right]$，由 $\mathrm{Ai}(z)=\frac1\pi\sqrt{z/3}\,K_{1/3}(y)$、$\mathrm{Ai}'(z)=-\frac{z}{\pi\sqrt3}K_{2/3}(y)$ 及 $2+\delta\chi z^{3/2}=(1-\delta)+\frac1{1-\delta}$ 可证恒等。经典极限 $\chi\to0$ 退化为 Schwinger 谱 $\frac{dP}{d\omega}=\frac{\sqrt3}{2\pi}\frac{\alpha\gamma}{\rho}F(\omega/\omega_c)$、总功率 $\frac23\alpha\chi^2$（V4 与 pytest 已验证此极限）；积分量检验可用 $P=P_{cl}\,g(\chi)$，$g\approx[1+4.8(1+\chi)\ln(1+1.7\chi)+2.44\chi^2]^{-2/3}$。
-
-   对接方式：闭合一圈的角积分 $\left.dE/d\omega\right|_{\omega_m}$ 对应 $T\cdot dP/d\omega$（V4 的用法）。**必须在反冲移动后的谐波 $\omega_m = \dfrac{m\Omega}{1+m\Omega/\varepsilon}$ 处评估**：BK 双积分的周期性由 $\omega\varepsilon/\varepsilon'$ 决定，无边界项的条件是 $\omega\varepsilon/\varepsilon'=m\Omega$；在裸 $m\Omega$ 处评估会带入 $\propto m\,\omega/\varepsilon$ 的边界项——V3 中随 $m$ 增长的 0.1%→3% 偏离（远大于 $O(\omega/\varepsilon)=0.2\%$）疑为此伪影而非量子修正，交叉验证时一并澄清。参数：$\rho=\gamma^2/\chi$，$\chi\in\{0.05,0.2,0.5,1\}$，$\delta\in[0.01,0.6]$，$N_t\gtrsim10\,m_c$（$m_c=\tfrac32\gamma^3$，$\gamma=10$ 时 1500）。$\gamma=10$ 的 $1/\gamma^2$ 修正约 1%，足以判定 dot/trace（两者主项差因子 $1-\delta$，$\delta=0.3$ 时差 30%）。
-
-   **V8 的定位与盲区（2026-09-11 澄清，避免重复困惑）**：V8 的对照物 `reference.quantum_synchrotron_rate` **就是项目的 LCFA 速率**——恒定场里两者是同一个函数（Macdonald ≡ Airy ≡ `optical_depth_tables.gen_photon_prob_rate_for_delta`，实测差 $10^{-15}$），这不是巧合而是 LCFA 的定义。因此 V8 **不可能**区分 BK 与 LCFA，它检验的是**实现**（前因子、反冲相位、$\omega^2/\gamma^2$ 接触项、dot/trace 核），不是理论差异；它的价值在于"两者必须一致区"过关，否则 BK 与 LCFA 的任何差别都分不清是物理还是 bug（BUG-6 就是这样被抓出来的）。V8 看不见 LCFA 缺失的东西，原因见 [§8.1](#81-圈间相干一个已经测到但当时标错了名的-lcfa-判别信号2026-09-11)：场恒定 + 只用一圈 + 对照点取在谐波中心。另外要分清两个层次——V8 对照的是 LCFA 的**速率**（解析闭式），不是 LCFA 的**用法**（沿轨迹积分／蒙卡事件采样）；恒定 $\chi$ 下两者数值等价，所以 V8 对后者同样无话可说。
-5. ✅ **P-2 局部能量核**（2026-09-09 完成；**相位 2026-09-16 修正**）：把 $N(t_1,t_2)$、$\Phi$ 推广到 $\varepsilon(t_1),\varepsilon(t_2),\varepsilon'_i = \varepsilon_i - \omega$（改动在 kernel.py + phase.py + integrator.py + types.py，`Trajectory` 增加可选能量历史字段 `energy`；局部形式由对称化推导、靠测试钉死，详见 §4 P-2）；
-6. ✅ **P-3 重新诊断 + 适用性守卫**（2026-09-11）：原例 $-4922$ 实为**采样混叠**（欠采样 8 倍）；真实失败模式是低 $\omega$ 的端点亏损。已加 `SamplingWarning`/`RecordLengthWarning`（§4 P-3）。**未做**：端点亏损的物理修正——先做收敛性研究定靶（$L\lesssim\tau_f$ 时"弧长×常数场辐射率"**本身就不是正确靶值**），再考虑端点渐近延拓或 $(L-|\tau|)$ 尾部修正；
-7. ✅ **P-4 自适应锥角 + 角度守卫**（2026-09-11 完成）：`default_theta_max` = $\min(\pi,\text{swing}+3\max_\omega\theta_c)$、`cone_directions` 两板规则、`AngularConvergenceWarning`。**原文"高 $\omega$ 漏尾巴"的方向判断被实测推翻**——是软光子端被截（§4 P-4）。未做：沿速度路径自适应布网格（闭环情形的根治）。
-
-### 阶段 C — 性能（在 B 的验证之上，避免优化错误代码）
-
-8. ✅ Numba 化（2026-09-08，见 §5）；形成长度带状截断待做（现为最大杠杆，兼治 P-3）；
-9. ✅ 多 $(\omega,\mathbf n)$ 批量接口 `double_time_integral_batch` / `BKIntegrator.d2_energy_batch` 已随 numba 后端提供；多**轨迹**批量（共享 ω/n 网格）待做。
-
-### 阶段 D — PIC 集成
-
-10. **单位适配器** `SimUnitAdapter`：Simulation SI 量 → Compton 单位，封装 `units.si_to_natural`；
-11. **轨迹记录回调** `TrajectoryRecorder`：`@callback` 挂 `_interpolator` 阶段，按 `_id` 追踪选中粒子（含跨 patch 迁移），输出 `Trajectory`（记录无反冲背景——注意：带 LCFA 反冲的轨迹不能喂给本模块，模块 README 已声明防双计）；
-12. **系综求和**：$S_{total} = \sum_i w_i S_i$（`Spectrum` 加权加法器 + 按权重归一）；
-13. **BK/LCFA 混合策略**（本模块在 PIC 中的实际用法，两种模式）：
-    - *离线后处理模式*（推荐先做）：跑一次无反冲 PIC（关掉 radiation），录轨迹，BK 出谱——用于研究低 ω 红外区、形成长度效应、离散谐波结构；
-    - *在线事件模式*（高级、可选）：从 BK 微分速率 $dW/d\omega$ 构造光学深度采样器替换 LCFA 表。注意 BK 是非局域理论，直接采样需要"形成长度内局域化"近似；多数代码的做法是保留 LCFA 事件生成、BK 只做谱后处理与 LCFA 表校准。
-
-### 阶段 E — 工程化
-
-14. CI 中跑 pytest 化的 V1–V7 + 一个端到端 PIC 轨迹 → BK 谱冒烟测试；
-15. 文档：修复 §3 悬空引用，README 增补"如何从 Simulation 得到一条 Trajectory"的最小教程。
-
----
-
-## 8. BK 相对传统（LCFA）方法的物理价值定位
-
-路线图服务于用户目标"得到传统方式得不到的量子相关的结果"。明确本模块能给出的、LCFA 管线给不出的东西：
-
-1. **红外/软光子区精确谱**：LCFA 表在 $\omega \lesssim$ 特征红外截断处失效（且采样表有 $\chi_{min}$ 截断，见 [optical_depth.py:35](lambdapic/src/lambdapic/core/qed/optical_depth.py#L35)），BK 双时间积分在此天然有限；
-2. **形成长度非局域效应**：LCFA 假设场在形成长度内不变；BK 对有限长度/变场结构精确，可定量给出 LCFA 的适用边界；
-3. **离散谐波与干涉结构**：wiggler 类结构化场、长脉冲尾场的谐波谱，LCFA 连续近似看不到；
-4. **反冲的非微扰处理**：$\varepsilon/\varepsilon'$ 相位因子 + $\varepsilon'=\varepsilon-\omega$ 全阶保留；
-5. **PIC 级对比基准**：作为 LCFA 表的离线校准/验证工具（χ 边界处）。
-
-同时也应写清 BK 的适用边界：准经典方法假定 $\chi \lesssim 1$ 且光子自旋/电子自旋已求和（`spin_averaged`、`polarization_summed` 固定为 True）——自旋分辨谱需要新的核，是更远的扩展。
-
-### 8.1 圈间相干：一个**已经测到、但当时标错了名**的 LCFA 判别信号（2026-09-11）
-
-**LCFA 缺失的东西只有一个根源：相位。** BK 保留完整的双时间相位
-
-$$\iint \mathrm dt_1\mathrm dt_2\;N(t_1,t_2)\,e^{-i\Phi(t_1,t_2)},$$
-
-而 LCFA 管线是局域、非相干的 $\int \mathrm dt\;\dfrac{\mathrm dW_{\rm LCFA}}{\mathrm dt\,\mathrm d\omega}\big(\chi(t)\big)$——蒙卡事件生成尤其如此，**事件之间没有任何相位关系**。这一个差别在三种情形下显形：形成长度内的场变化、离散谐波／圈间干涉、有限磁铁的边缘辐射。§8 上面第 2、3 条说的就是它们。
-
-**圆轨道上的具体形式。** $n$ 圈记录的谱线宽度与间距分别是
-
-$$\Delta\omega_{\rm line}=\frac{2\pi}{L}=\frac{\Omega}{n},\qquad \Delta\omega_m=\Omega\left(\frac{\varepsilon'}{\varepsilon}\right)^2
-\quad\Longrightarrow\quad \text{分辨条件 }n\gg\left(\frac{\varepsilon}{\varepsilon'}\right)^2=\frac{1}{(1-\delta)^2}.$$
-
-$\delta=0.5$ 处需要几十圈；$\delta=0.05$ 处一圈就够。
-
-**这个效应我们已经测到过——就是 P-3(d) 第 1 条那个 $\mathrm dE/\mathrm d\omega\propto L^2$。** 当时它的标签是"拿 $L\,\mathrm dP/\mathrm d\omega$ 作靶是范畴错误"（定靶失败），但同一个标度换到"BK vs LCFA"的视角下就是**圈间相干的直接证据**：谱线密度 $\propto L^2$（振幅 $\propto L$ 相干叠加），线宽 $\propto1/L$，线能量 $\propto L$。两条说法都对——它是一个真实的物理效应，只是当时被当成记账问题记下了。**注意"$n\to\infty$ 收敛到连续谱"这句要拧紧**：固定 $\omega$ 处的密度是 $\propto n^2$ **发散**的，收敛的只是**包络**（或按线能量归一后的密度），这正是当初的范畴错误的来源。
-
-**干净的定量预言**（可直接检验）：
-
-$$\frac{\text{BK 谱线中心密度}}{\text{LCFA 连续谱密度}}=n,$$
-
-$n=1$ 时比值为 1——那正是 V8 的结果。
-
-**V8 看不见它的三条原因**（按重要性）：(i) `circle_trajectory` 默认**一圈**，而 $\delta=0.5$ 处线宽 $\Omega$ 比线间距 $0.25\Omega$ 还**大 4 倍**，相邻谱线完全重叠，离散结构早已糊掉；(ii) 对照点选在**谐波中心**，而"一圈密度在谐波中心恰等于连续谱密度"就是 [reference.py](lambdapic/src/lambdapic/core/qed/baier_katkov/reference.py) 那条"无 Jacobian"论断本身——**这是两理论按构造相等的唯一一点**；(iii) 靶取的是连续谱包络。
-
-**成本与钥匙。** $n$ 圈要求 $N_t\propto n$，而双重积分是 $O(N_t^2)$，故代价 $\propto n^2$（20 圈 $=400\times$，约每点一小时）。~~**带状截断**（核按 $\lvert t_1-t_2\rvert\lesssim\tau_f$ 局域，而 $\tau_f\ll T$）把它降成 $O(N_t)$，即 $\propto n$——20 圈从一小时变三分钟。这是带状截断值得排在 PIC 集成之前的**第二个**理由（第一个是多粒子成本，见 §7-D 第 12 条）。~~
-
-> ⛔ **上面这段已被 §8.2 的判据实验推翻（2026-09-14）**：$\tau_f\ll T$ 恰恰是问题所在——相干要求保留跨周期配对，而被积函数的滞后分布根本不衰减，截断掉的不是尾巴而是相消项。带状截断不但不能解锁本扫描，反而正是破坏它的那件事。$n$ 圈扫描的候选工具改为**周期性分块**（§8.2 结论 3）。
-
-**必须诚实的两点边界**：
-
-1. $n$ 圈相干叠加要求**这 $n$ 圈中间不发生辐射**——一旦某个圈发了一个光子，$\varepsilon$ 变了，后续圈的相位关系就断了。所以 $n^2$ 增强是**理想化上界**，真实上限由每圈发射概率、能量展宽与场的不完美共同压制，圆轨道上还有辐射损失导致的轨道收缩。这个效应真正有观测意义的场所是 **undulator**（$N_w$ 有限但可控，谐波结构实打实被测到）。
-2. **LCFA 速率本身没有错。** 在恒定场里它与精确同步辐射谱逐位相同（实测 $10^{-15}$，且项目 LCFA 表用的就是同一个函数）。错的是把它当成能给出谱线结构的工具；只要观测分辨率粗于线间距，LCFA 完全够用。
-
-**判据实验：已做（2026-09-11），三个标度同时成立。** 见新文件 [coherence.py](lambdapic/src/lambdapic/core/qed/baier_katkov/coherence.py)（测量）+ [coherence_plot.py](lambdapic/src/lambdapic/core/qed/baier_katkov/coherence_plot.py)（图，独立于 `validation_summary.png`）。参数：$\gamma=5,\chi=0.5,\delta=0.5$（$\rho=48$、$m=245$），$n=1,2,4,8,16$，$N_t=4.4\,m\,n$。**取 $\gamma=5$ 而非 10**，因为 $m\propto\gamma^3$（245 vs 1990），而线宽以线间距为单位时与 $\gamma$ 无关——代价降一个量级而信号不变。
-
-| $n$ | 线中心密度 /（$T\,\mathrm dP/\mathrm d\omega$） | $n^2$ | $\Gamma$ | $n$ | FWHM/线间距 | $1/n$ | 线能量比 | $n$ |
-|---|---|---|---|---|---|---|---|---|
-| 1 | 1.0030 | 1 | 1.0030 | 1 | 不可测 | 1.000 | 0.834 | 1 |
-| 2 | 4.0120 | 4 | 2.0060 | 2 | 0.478 | 0.500 | 1.981 | 2 |
-| 4 | 16.0480 | 16 | 4.0120 | 4 | 0.227 | 0.250 | 4.009 | 4 |
-| 8 | 64.1920 | 64 | 8.0240 | 8 | 0.1115 | 0.125 | 8.021 | 8 |
-| 16 | 256.7679 | 256 | 16.0480 | 16 | 0.0555 | 0.0625 | 15.97 | 16 |
-
-**结论**：
-
-1. **$n^2$ 律成立，指数精确为 2**：偏差恒为 $+0.30\%$ 且**与 $n$ 无关**（1.0030 / 4.0120 / 16.0480 / 64.1920 / 256.7679），这个常数是角积分量子化因子（对所有 $n$ 相同），不是标度偏离。$\Gamma=n$ 随之成立（$=1.0030\,n$）。
-2. **线宽 $\propto1/n$**，实测常数 $0.444(\varepsilon/\varepsilon')/n$。**朴素 Dirichlet 估计给它的两倍**（$|\sin(ny)/y|^2$ 半高在 $ny=1.3915$），该因子 $2$ 未解——故只报实测常数，不作解析断言。
-3. **线能量 $\propto n$**（$n=1$ 处 0.834 偏小，因为一圈线宽超过谱线间距、邻线溢出窗口；$n\ge2$ 后线性到 0.2% 内）。
-
-**方法论收获（两条，都是踩过的坑）**：
-
-- **$n=1$ 的 Dirichlet 核恒等于 1**（$\sin(nx)/\sin x$ 在 $n=1$ 时为恒等），所以一圈记录**根本没有线结构**——$\delta=0.5$ 处一圈线宽 $\Omega$ 比线间距 $0.25\Omega$ 大 4 倍，谱是彻底糊掉的连续谱。这才是 V8 看不见此效应的**根本原因**，而不是"对照点没选好"。V8 是这条测量在 $n$ 轴上的零端点（$\Gamma(1)=1.003$ 正是 V8 的比值）。
-- **角守卫在线谱上会误报。** 通用 `AngularConvergenceWarning` 按 $|\mathrm dE/\mathrm d\omega|$ 选探针，而线谱的**线间**值是相消残差：实测那里角网格微扰带来 $>140\%$ 的变化，而线中心只动 $1.9\times10^{-5}$。驱动器因此**只屏蔽这一条警告，并用 `coherence.verify_angular_convergence`（针对线中心的收敛检查）替代**——不是放宽阈值掩盖。守卫本身也已从"逐点相对 + min/max/median 探针"改成"**峰值相对 + 权重最大探针**"（§4 P-4 (d) 第 3 条）。
-
-**未做**：带状截断。$\gamma=5$ 下 $\sum n^2$ 的代价可承受（全扫描约 5 分钟），所以本实验**没有**验证"带宽取 $3\text{–}5\tau_f$ 不破坏 $n^2$ 增强"——那条仍然悬着，等带状截断实现后补测。
-
----
-
-## 8.2 带状截断的判据实验（2026-09-14）：**结论是"不做"**
-
-> 起因：§5 P2 与 §8.1 把"形成长度带状截断"列为下一个工作项，§8.1 更断言它是"解锁 $n$ 圈相干扫描的钥匙"（把 $\sum n^2$ 降成 $\propto n$，20 圈从一小时到三分钟）。做之前先验前提。**测量推翻了这条断言，并且比预期更强：带状截断在测过的每一种情形下都不是受控近似，不应实现。**
->
-> 方法：模块外一次性脚本（`/tmp/band_probe.py`、`/tmp/band_curve.py`、`/tmp/band_block.py`，均未入库），用模块公开件自己算带掩码的双时间和。参数同 Test B：$\gamma=5$、$\chi=0.5$、$\delta=0.5$，$T=307.81$、$\tau_f=24.66$、$\tau_f/T=0.0801$、$m=245$、$\omega_m=2.500260$。**harness 自校验：无掩码时复现 `compute_spectrum` 到 $1.17\times10^{-12}$**，且 $n=1,2,4,8$ 的全和比值逐位复现路线图的 1.0030 / 4.0120 / 16.0480 / 64.1920。
-
-**(a) 滞后分布根本不衰减（决定性）**。在每个反冲移动谐波处，把第二个顶点整体前进 $d$ 个周期的块积分
-$$M(d)=\sum_{i,j\in\text{一圈}}w_iw_j\,N\,e^{-i\Phi(t_i,\,t_j+dT)}$$
-实测 $|M(d)|/|M(0)|=\mathbf{1.000000}$、相位 $=0$ 精确成立，$d=0\dots15$。这是解析必然：轨迹严格周期使 $\Phi(t_1+T,t_2+T)=\Phi(t_1,t_2)$，而谐波条件 $\omega\varepsilon/\varepsilon'=m\Omega$ 给出块相位 $\Delta\Phi=2\pi m d$（与方向 $\mathbf n$ 无关）。**即 $n^2$ 律就是 $n^2$ 个等幅同相块的相干叠加**，"远端配对可以丢"与它就是同一句话的反面。
-
-**(b) 截断曲线 $C(W)/C(\infty)$——小于整条记录都不收敛**（$C(W)$ 为限制 $|t_j-t_i|\le W$ 的角积分谱；列名中 τ 为单位 $\tau_f$，T 为单位周期）：
-
-| 记录 | $1\tau$ | $3\tau$ | $5\tau$ | $12\tau$ | $0.5T$ | $1T$ | $2T$ | $3T$ |
-|---|---|---|---|---|---|---|---|---|
-| 圆 $n=1$，线中心 | 0.103 | 0.305 | 0.516 | 0.909 | 0.877 | 1.000$^*$ | — | — |
-| 圆 $n=4$，线中心 | 0.152 | 0.453 | 0.766 | 1.348 | 1.301 | **0.996** | **1.168** | **3.452** |
-
-$^*$ $n=1$ 的记录只跨 $1T$，$W\ge T$ 即全和。$n=4$ 时 $W=3T$ 已覆盖记录的 75%，截断和仍是全和的 **3.45 倍**，且 $C(W)$ 随 $W$ 上下乱跳（有符号部分和，非单调）。**被截掉的不是尾巴，是相消项**——闭合轨道上每个周期贡献完全相同，求和只靠整条记录上的相消才收敛。
-
-> ⚠️ **本表的数字已作废（2026-09-15）**：§8.3(a) 复核发现产出它的探针有分箱 bug（逐箱值与逐对枚举不符）。结论本身在更严格的实现与更真实的记录上更强地成立，但**具体数字不要引用**；用 `baier_katkov/banding.py` 重算。
-
-**(c) 朴素带破坏 $n^2$ 律，且不是"差一个系数"**。$\Gamma=$ 带和/$(n\cdot\text{LCFA})$ 在固定 $B$ 下**与 $n$ 无关**（$B=3$：1.72 / 1.64 / 1.60；$B=2$：5.22 / 5.57 / 5.75），即带和 $\propto n$、全和 $\propto n^2$。判据是"$\Gamma$ 变成 $n$-无关"，**不是 $\Gamma\to1$**——$B=3$、$n=1$ 时 $\Gamma=1.72$ 已经接近教科书式的 1，极易被误读为"收敛良好"。同时 $\Gamma$ 强烈依赖 $B$（$1.6$–$5.7$），说明结果由带宽任意决定。
-
-**(d) 梳状带 $|t_2-t_1-kT|\le B\tau_f$ 既不准也不省**。$k$ 取 $0\dots n-1$ 的窗口并集：`comb/full` $=3.06$（$B=1$）、$1.59$（$B=3$）、$2.45$（$B=5$）——**比全和还大**，随 $B$ 增大才降向 1（因为宽窗才把相消项放回来）。每行必须访问 $n$ 个窗口，保留的对数占比 16% / 47% / 79%（$B=1/3/5$），对全和的加速比是**常数** $1/(0.16B)=6.25/B$（2026-09-16 更正：原稿写 $T/(4B\tau_f)=3.12/B$，差了 2 倍；$0.16=2B\tau_f/T$ 正是保留占比测得值）——$B=3$ 时约 2×，$B=5$ 时约 1.25×，**没有渐进收益**。原写法只取 $k\ge0$、破坏厄米对称，需折到最近周期。
-
-**(e) 非周期记录同样不收敛（但测试台本身有限）**。chirped 记录（$\Omega(t)=\Omega_0(1+0.5\sin\omega_s t)$）上 `banded/full` 在 $B\le10$ 内于 $-0.95$ 到 $5.14$ 之间乱跳、含负值。诚实边界：该记录只有 $4T$ 长，而 $T/\tau_f=12.5$，$B\le10$ 的带宽必然短于一个周期，**这个测试台无法充分判定宽带情形**——但也没有给出任何支持截断的证据。
-
-**(f) 附带发现：线中心的双时间和是量级 $10^5$ 的相消**。把单圈块的首样本权重从 $\Delta'/2$ 改成 $\Delta/2$（相对变化 $\sim5\times10^{-4}$）后块和由 $+2.08\times10^{-2}$ 翻成 $-4.2\times10^{-3}$。$\sum|\text{terms}|/|\text{value}|\approx2.5\times10^5$（独立复现）。**任何把双时间和拆成子和的方案（截断、分块）都会继承这个放大因子**：全和稳定是因为相消发生在求和内部，部分和不是。
-
-**结论与后续**：
-
-1. **不实现带状截断**。它既不能解锁 $n$ 圈扫描（那正是它破坏的东西），在测过的非周期情形下也拿不出可信带宽；而"取够大的 $B$"会在 $B\gtrsim3$ 时把收益吃光。
-2. §8.1 的"钥匙"说法**作废**，§5 P2 的该项**关闭**。若将来仍要做 PIC 加速，必须先在一个**真正宽带、且长度 $\gg T$ 的**测试台上重新做 (b) 的截断曲线——那是本项重启的前置条件。
-3. $n$ 圈扫描的候选工具只剩**周期性分块**。**2026-09-16 更正：它只需要一次单圈全和，不是 $O(n)$ 次。** 严格周期时 $M(d)=e^{-i\phi d}M(0)$（$\phi=\omega fT$ 为块相位，反冲移动谐波处 $\phi=2\pi m$ 故 $M(d)=M(0)$ 精确），于是
-$$I_n=M(0)\sum_{d=-(n-1)}^{n-1}(n-|d|)e^{-i\phi d}=M(0)\,\frac{\sin^2(n\phi/2)}{\sin^2(\phi/2)}$$
-（Fejér 核，连续时间下严格）——**就是 $n=1$ 那条谱乘一个解析因子**。原稿的"$O(n)$ 次单圈积分"和 §8.2(f) 的"块和数值稳定性是前置障碍"都随之消失：只算一次单圈全和，它稳定与否与本节其余部分无关。网格端点半权重带来的偏差正是 §8.1 测到的 $+0.30\%$。
-4. 方法学：本项目已连续三次出现"方向判断被实测推翻"（P-3、P-4、本节）。**凡涉及"某个近似可以丢"的判断，先做单变量截断曲线，再谈实现。**
-
-> ⚠️ **补记（2026-09-16 复核）：(b)–(e) 的可信度分级。** (b) 的 $C(W)$ 表已作废（分箱 bug），其数字出自 `/tmp/band_curve.py` 的**逐 lag 累积**路径（`lag_spectrum`）；(e) 的 chirped `banded/full` 走同一条路径，**故 (e) 的数字同样待复算**。**(c)/(d) 不同**：它们由 `/tmp/band_probe.py` 的 `masked_dE` 算，掩码直接作用在真实时间差上（`lag_band` / `lag_comb` 生成布尔掩码，不经分箱），结构结论（带和 $\propto n$、梳状带每行访问 $n$ 个窗口）只依赖掩码本身，**保留**。但 (c)(d) 的数值同样**尚未用 `banding.py` 复算**，稳妥起见统一标"待复算"——本节没有任何一条数字是用入库实现复算过的。
->
-> ⚠️ **补记（2026-09-16）：判据取在线中心，是有意为之，但推论有边界。** 带状截断按定义丢掉的正是**圈间相干**，而线中心就是相干叠加的所在，所以线中心**永远不可能**收敛——(b)(c) 由此只证明了"**带状截断不能做 $n$ 圈相干扫描**"，**没有**证明"它对粗粒化谱不是受控近似"：(c) 的 $\Gamma$ 与 $n$ 无关恰恰是**非相干极限**的特征（带和 $\propto n$ $\Leftrightarrow$ 每圈独立相加，正是截断想要的），而 $\Gamma$ 对 $B$ 敏感更像是硬矩形掩码在 lag 上的**振铃**。**对非周期 PIC 记录重启本项时，观测量要换成频率平均谱、掩码要换成平滑窗**（而非矩形），否则会重复"用相干判据否掉非相干近似"的错。
-
----
-
-## 8.3 PIC 集成最小闭环 + 真实轨迹上的带宽判据（2026-09-15）
-
-> 目标（用户选定"最小闭环"）：把**真实 PIC 轨迹**喂进 BK 模块的通路打通，并在它上面重做 §8.2 悬着的"非周期情形带宽是否可用"。
-
-**交付物**（4 个新文件 + 2 处小改）：
-
-| 文件 | 内容 |
-|---|---|
-| `trajectory.as_trajectory_si` | SI 适配器：$t,x$ 走 `units.si_to_natural`，$\mathbf u$ **直接透传**（PIC 的 `ux,uy,uz` 就是同一约定），不合成 energy（在壳回退到 $\gamma$ 是精确的） |
-| `callback/trajectory.py` `TrajectoryRecorder` | 挂在 **`start`** 而非路线图原写的 `_interpolator`；按全局 id 追踪；NaN 填充固定形状落盘 |
-| `baier_katkov/banding.py` | 判据工具：按物理滞后分箱、相消比、截断曲线（做成 `Trajectory` 上的函数） |
-| `example/bk-testbed.py` | 静磁场回旋测试台（可控 ∇B 漂移 = 退相干旋钮） |
-| `tests/test_trajectory_recorder.py` | 6 例（stage 注册、浮点 interval 拒绝、防双计守卫、落盘往返、id 稳定、pusher 快路径等价性） |
-
-**(a) §8.2(b) 的表是错的——旧探针有分箱 bug，该表作废。** 旧的 `/tmp` 实现给出的逐箱值与逐对枚举不符（第 0 箱给 $-0.0205$，而解析值 $4\pi\sum_i w_i^2 N_{ii}=-88.5$；新实现在同一输入上给 $-88.3$）。新的 `banding.lag_profile` 经两级验证：小算例上**逐对枚举精确一致**（$\le6\times10^{-14}$），真实记录上在**精确箱号**处与直接掩码求和一致。**§8.2(b) 的数字应视为作废**，但那条结论（不收敛）在新数据上更强地成立。
-
-**(b) 由此暴露的一个操作陷阱**：$C(W)$ 在箱尺度上是不连续的（相消比 $10^4$–$10^6$，多算一列配对就能让比值跳几个单位），所以"在某个 $W$ 处插值"是没有意义的操作。新实现把 `lag` 报成**箱上边界**，而 `cumulative[i]` 覆盖的是 $\text{lag}<\text{lag}[i]$（等于边界的配对落在下一箱）——2026-09-16 更正：原稿这里写成"lag ≤ lag[i]"，与 §8.3(g)#1 的修正矛盾。
-
-**(c) ⛔ 已作废：$g\ne0$ 的记录不是物理构型（2026-09-15 复核发现）。** 空间变化的静态 $B$ **不是无源麦克斯韦方程的解**：$B=B_z(y)\hat z$ 满足 $\nabla\cdot\mathbf B=0$，但 $\nabla\times\mathbf B=(\partial B_z/\partial y,0,0)\ne0$ 而 $\mathbf j=0$，于是 Yee 更新 $\partial E_x/\partial t=c^2\,\partial B_z/\partial y$ **每步泵入 $E_x$**。实测（粒子处的插值场）：$g=0.02$ 时第 20 步 $E_x=9.2\times10^{13}$ V/m → 第 800 步 $1.3\times10^{15}$（饱和在 $\sim10^{-3}E_{\rm cr}$）；$g=0$ 时恒为 0。
-
-后果链：
-
-- $|\mathbf u|$ 不守恒（$g=0.065$ 起伏 $6.5\%$，且**精确线性于 $g$**：起伏$/g=0.992,1.005$），而 BK 要求无反冲背景；
-- 我标定的"∇B 漂移 $1319g$"**其实是 $\mathbf E\times\mathbf B$ 漂移**（实测 $E_{\rm sat}/B\times T=3.06$ 自然单位/周期，方向也对得上），真正的 ∇B 漂移在这几何下是 $+x$ 方向约 0.8 自然单位/周期；
-- 盒子的尺寸与起点偏移都是按这个假象标定的。
-
-**所以 $g=0.02$ 与 $g=0.065$ 两行、(e) 的全部退相干论证、以及"退相干把曲线驯服了几个数量级"那句话，全部作废。** $g=0$ 那行**有效**（均匀场是合法解，$\nabla\times\mathbf B=0$）：它确认了管线正确、并确认周期情形不收敛。
-
-| 记录 | $L$ | 相消比 | $1\tau_f$ | $3\tau_f$ | $10\tau_f$ | $0.2L$ | $0.5L$ | $0.9L$ |
-|---|---|---|---|---|---|---|---|---|
-| $g=0$（均匀场，**有效**） | $10.2T$ | $2.0\times10^7$ | $+2625$ | $+3849$ | $+919$ | $-2669$ | $+156$ | $-382$ |
-
-**教训（写进方法论）**：施加到 PIC 里的场必须**同时**满足 $\nabla\cdot\mathbf B=0$ **和** $\nabla\times\mathbf B=\mu_0\mathbf j$（或与 $\partial\mathbf B/\partial t$ 对应的 $\nabla\times\mathbf E\ne0$）。我只查了前者。**静态非均匀磁场在无源 PIC 里根本不允许**——这砍掉了"用场梯度当退相干旋钮"这条路。
-
-**(d) 采样判据是硬约束，磁场构型也不例外。** $\text{margin}=dt\,(\omega\varepsilon/\varepsilon')\max_{\mathbf n}\lvert1-\mathbf n\cdot\mathbf v\rvert/\pi<1$，其中 $\max_{\mathbf n}$ 由**反平行方向**取得（$\approx2$，不是前向 $1/\gamma$ 瓣）。以 $\gamma=5,\chi=0.5$、$dx=0.5$ 自然单位（CFL 给 $dt=0.336$、每回旋周期 916 步）为例：**$\omega_c$ 处 margin $=3.17$，欠分辨**；只有 $\omega\lesssim2.2$（约 $0.6\omega_c$）可用。要分辨 $\omega_c$ 需 $dt\approx0.1$、$dx\approx0.15$，即约 600 格的轨道与约 800 格的盒子。**注意测试台 docstring 里"与判据天然相容"的说法是错的**，已更正。
-
-> ⚠️ 本条也更正了初稿的一处错误：初稿引用的 margin $=0.847$ 出自 `example/bk-testbed.py` 里**手写的**公式（**漏了 $\omega$ 因子**）。改用模块自己的 `sampling_margin` 复核后是 $3.17$。与 §8.3(a) 同类教训：**判据要调用模块函数，不要手抄公式**。
-
-激光构型在同一判据下更差：覆盖谱峰（$a_0^3\omega_0$ 或对撞 $2\gamma^2\omega_0$）需每周期 $10^2$–$10^3$ 步，而 $dx=\lambda/32$ 的 CFL 只给 48。**所以"用磁场"仍是对的选择（欠分辨 2–3 倍 vs 激光的 10–20 倍），但理由不是"天然相容"，而是"便宜得多"。**
-
-**(e) 未解决：非周期测试台重新完全悬空，而且多了一条硬约束。** (c) 作废后，"∇B 漂移当退相干旋钮"这条路被砍掉了。剩下的路径只有**真正宽带的构型**（激光脉冲/尾场），它受 (d) 的采样判据限制；而且激光驱动的电子 $\gamma$ 会变，需要 `banding.py` 支持局域能量相位——**当前实现遇到带 `energy` 的轨迹直接抛 `NotImplementedError`**（这是有意的，见 §8.3(g)）。**（2026-09-16：BUG-10 修完，此障碍已解除；`banding.py` 的局域相位支持已实现，并在生产 LWFA 的真实加速记录上用正确相位复算了判据——见 §8.6，**结论仍是"不做"**：真实非周期记录上截断曲线同样不收敛。）****因此 §8.2 的"不做"决定维持不变，非周期情形仍未判定。**
-
-**(f) 环境坑**：`Simulation.run()` 每次都会做 PyPI 版本检查，本机无外网时阻塞约 9 s（实测占一次 run 的 95%）。跑算例前设 `LAMBDAPIC_CHECK_UPDATE=0`。
-
-**(g) 第二轮复核发现的其他缺陷（2026-09-15，均已修或已标注）**：
-
-| # | 位置 | 问题 | 状态 |
+| 编号 | 一句话 | 日期 | 提交 |
 |---|---|---|---|
-| 1 | `banding.py` docstring | `lag` 是箱**上边界**，故 `cumulative[i]` 覆盖的是 $\text{lag}<\text{lag}[i]$，docstring 写成了 $\le$（实测两者差 36%） | 已修 |
-| 2 | `banding.py` | 硬编码 `dot_kernel`，忽略 `params.kernel`（trace 核下差 7%） | 已修 |
-| 3 | `banding.py` | 只给 `dirs` 不给 `dom` 时被静默丢弃 | 已修 |
-| 4 | `banding.py` | 默认方向网格是**粗糙**求积：`dE_domega` 与收敛角积分差 $0.63$–$2.4$ 倍，$\omega=4$ 处符号都不同。**它是探针量，不是谱** | 已在 docstring 标注 |
-| 5 | `trajectory.as_trajectory_si` | **到不了局域能量模式**：模块靠 `Trajectory.energy` 切换，而 `local_energy()` 全包无人调用；加速轨迹会被**静默**按固定 $\varepsilon$ 评估（原报"$\omega=1$ 处差 4.5 倍"出自 BUG-10 的坏相位，**作废**；§8.5 修复后重测 γ: 2→6 加速弧：频带积分 0.63–1.10 倍、峰 $\lvert\mathrm dE/\mathrm d\omega\rvert$ 1.6 倍——仍是真的，只是远没有 4.5 倍） | 已加 `energy` 入口 |
-| 6 | `trajectory.as_trajectory_si` | `int(n_samples)` 对 $(K,)$ 数组在 numpy 2.4 抛 `TypeError`（记录器写的正是数组） | 已修 |
-| 7 | `callback/trajectory.py` | `np.savez` 会补 `.npz` 后缀，而 `write()` 返回原路径 → 对无后缀路径返回的文件不存在 | 已修 |
-| 8 | `callback/trajectory.py` | "记录与 rank 数无关"的说法过强：id 的高 14 位是 rank，故 rank0 的粒子永远排在 rank1 之前，选到哪个物理粒子取决于 rank↔patch 分配 | 已改为准确表述 |
-| 9 | `example/bk-testbed.py` | $\chi$ 与 $\rho$ 都差一个 $\beta$：`B = CHI/gamma` 实际给出 $\chi=\gamma\beta B=0.4899$、$\rho=48.99$，而 `larmor_radius` 给 48.00 | 已修（$B=\chi/(\gamma\beta)$） |
-| 10 | `example/bk-testbed.py` | 场数组的下标约定错：应为 `p.fields.yaxis[0,:]`（布局是 [内部, 上守卫, 下守卫]），我手写的 `(j-ng)*dy` 使剖面整体错位 $n_g$ 格 | 已修 |
-| 11 | `callback/trajectory.py` | `window=` 补偿的依据存疑：`MovingWindow` 的代码里**确实**读写粒子 `x`（utils.py:766-783、806-825），所以"它会平移坐标"未必错，但**未验证** | **已结案（2026-09-16，§8.5 BUG-13）：补偿是错的，参数已删**——`_shift_right`/`_shift_left` 只改 `p.x0`/`p.xaxis`/`fields.x0`/`fields.xaxis`，粒子的 `x` 从不平移，记录到的 x 本来就是实验室系 |
+| BUG-1 | `Parameters.recoil` 从未进入计算路径（静默忽略 + metadata 谎报） | 09-08 | `504879e` |
+| BUG-2 | `kernel` 字符串不校验，非法值静默回退 trace | 09-08 | `504879e` |
+| BUG-3 | `omega >= epsilon` 无守卫（除零 / 非物理有限值） | 09-08 | `504879e` |
+| BUG-4 | `trapz_weights` 单样本崩溃 | 09-08 | `504879e` |
+| BUG-5 | 前因子混用单位制，**所有绝对量偏大 $4\pi$** | 09-08 | `504879e` |
+| BUG-6 | trace 核抄写少一个 $\varepsilon/\varepsilon'$，"两核差 $O(\omega)$"是假象 | 09-08 | `504879e` |
+| BUG-7 | `angular_edge_fraction` 指向靠轴节点（把承担 38.6% 的边缘节点报成 0.033） | 09-12 | `2563766`（09-14 提交） |
+| BUG-8 | $\omega=0$ 静默 NaN / 裸 `ZeroDivisionError` | 09-12 | `2563766`（09-14 提交） |
+| BUG-9 | `Trajectory.mass/charge` 死字段（字段已删，改 `TypeError`） | 09-12 | `2563766`（09-14 提交） |
+| BUG-10 | **局域能量相位不具平移不变性** | 09-16 | `835b651` |
+| BUG-11 | 局域模式采样守卫漏 $\omega$ 因子（margin 偏 $1/\omega$） | 09-16 | `a86e02b` |
+| BUG-12 | `TrajectoryRecorder._merge` 跨 rank 合并是空操作 | 09-16 | `39499da` |
+| BUG-13 | `window=` 补偿错误（粒子 x 本就是实验室系） | 09-16 | `0578948` |
 
-**已验证无问题**（限定上面清单的边界）：`banding` 的和与积分器逐位一致（合成圆 7 个频率到 $10^{-13}$，真实记录 4 个频率到 $10^{-11}$）；梯形权重、$j\ge i$ 的加倍、厄米约定、相位符号、前因子全部相符；`truncation_curve` 与 `lag_profile` 自洽（`ratio[-1]=1`）；记录器的数据处理（粒子死亡、跨 patch/跨 rank 迁移在 `mpirun -n 2` 下与单 rank **逐字节相同**、重复 `write()` 文件不变、`start` 阶段确为推进前且确实保留了统一 pusher）；`as_trajectory_si` 的单位换算；测试台初始条件在壳；$\nabla\cdot\mathbf B=0$ 成立（错的是 $\nabla\times\mathbf B$）。
+另：09-16 同轮修 `_curvature_rate` 被静止段污染（含静止段的记录上 $L/\tau_f$ 报 $10^{-19}$，实为 $O(10)$）。每条修复都配了一个**修复前会失败**的测试。
 
----
+### 7.2 四条反复出现的教训
 
-## 8.4 判据检查：真实生产轨迹上 BK 到底能不能用（2026-09-16）
-
-> 门槛问题：**把真实 PIC 轨迹喂给 BK 模块，采样判据过得去吗？** 这决定整个 PIC 集成路线的意义。用仓库里现成的生产算例 `example/lwfa.py`（$a_0=2$、$n_e=0.01n_c$、$dx=\lambda_0/20$、500×800）实测。
-
-**(a) 网格决定的可用频段是 $\omega_{max}=0.372\,N\,\omega_0$。** 由 $\text{margin}=dt\,\omega\max_{\mathbf n}\lvert1-\mathbf n\cdot\mathbf v\rvert/\pi<1$，取 $\max=2$（反平行方向）与 2D CFL $dt=0.95\,dx/(\sqrt2 c)$，得 $\omega<\tfrac{\pi}{2}\cdot\tfrac{c}{0.672\,dx}=2.34\,c/dx$。写成 $dx=\lambda_0/N$：**$\omega_{max}=0.372\,N\,\omega_0$**。$N=20$ 时 $7.4\,\omega_0$——与实测（$\omega_0$ 处 margin 0.129、$5\omega_0$ 处 0.644、$10\omega_0$ 处 1.287）一致。
-
-> ⚠️ **上式是"全球面锥、$\theta_{max}=\pi$"的最坏情形（2026-09-16 补记）。** `sampling_margin` 只在**传入的方向**上取 max，$\pi$ 锥包含反平行方向（$\max|1-\mathbf n\cdot\mathbf v|\approx1+\beta\approx2$）才有那个 2。实际取用时锥角受 `compute_spectrum` 自适应限制在前向发射锥（$\theta_{max}\approx$ 摆角 $+3\theta_c$），此时 $\max|1-\mathbf n\cdot\mathbf v|\approx1-\beta\cos\theta_{max}$：本节的激光抖动电子（摆角 $\sim1$ rad）判据放宽约 2–5 倍（交叉 $\gamma$ 上移约 1.5–2 倍），尾场里小摆角的俘获电子（$\theta\sim K/\gamma$ 的贝塔管几何）可放宽到 $\gamma^2$ 量级。**所以"$\gamma=10$–100 不可行"只对激光抖动电子、全球面锥成立**，不能直接外推到 LWFA 真正关心的尾场俘获电子——后者的判据要按各自的锥角重算。
-
-**(b) 实测（生产 LWFA，$\gamma$ 从 1.0 升到 2.41）。** 该电子的**前 65% 的记录是静止的**（激光脉冲尚未到达，$\lvert\mathbf u\rvert\approx0$），相互作用段只有 174 步 $=6.1$ 个激光周期。在相互作用段上：曲率率 $=0.224\,\omega_0$，$\omega_c\approx1.5\gamma^3\cdot\text{rate}=4.7\,\omega_0$。
-
-**$\omega_c=4.7\,\omega_0<\omega_{max}=7.4\,\omega_0$ ⇒ 该记录的发射带是可分辨的。** 判据通过。
-
-**(c) 一般性约束（已由 (d) 的实测取代，2026-09-16 标注作废）：$N\gtrsim2.7\gamma^2$（表内为 $3\gamma^2$）。** 发射带伸展到约 $\gamma^2\omega_0$（**对撞/背散射**几何的多普勒上移分量——同向几何下不成立，见 §8.4(d)(2)），要求 $\omega_{max}\ge\gamma^2\omega_0$：
-
-| $\gamma$ | 发射带约到 | 需要 $N$（$dx=\lambda_0/N$） |
-|---|---|---|
-| 2.4（本算例） | $6\,\omega_0$ | 17 —— $\lambda_0/20$ **刚好够** |
-| 5 | $25\,\omega_0$ | 75 |
-| 10 | $100\,\omega_0$ | 300 |
-| 50 | $2500\,\omega_0$ | 7500 |
-| 100 | $10^4\,\omega_0$ | 30000 |
-
-**(d) 结论（2026-09-16 已用测量取代推测）**：
-
-1. **可行的一面**：模块的定位本来就是**红外/软光子区**（§8 第 1 条：LCFA 表在红外截断处失效）。$\lambda_0/20$ 的常规分辨率覆盖 $\omega\lesssim7.4\omega_0$，而**恰好是这个区域**是 BK 相对 LCFA 的价值所在。
-2. ⚠️ **几何更正**："发射被多普勒上移 $\gamma^2$ 倍"是**对撞/背散射**几何特有的。多普勒因子有两个环节（入射变换进电子静止系、出射变换回实验室系），**同向**几何下前者是红移 $\approx1/(2\gamma)$、与后者相消，汤姆孙散射回到 $\approx\omega_0$。LWFA 是同向几何，初稿套逆康普顿标度是错的。
-3. **实测标度（本节的落点）**：把 $a_0$ 从 2 扫到 16（其余同生产算例），每个 $a_0$ 记录最热电子，在相互作用窗口内用滑动窗量 $\omega_c=1.5\gamma^3\lvert\mathrm d\mathbf v/\mathrm dt\rvert$：
-
-   | $a_0$ | $\gamma_{\max}$ | 滑动窗（$\gamma$, $\omega_c/\omega_0$） | 网格上限 $7.4\omega_0$ |
-   |---|---|---|---|
-   | 2 | 2.42 | (1.11, 0.49) (1.44, 1.40) | ✓ |
-   | 4 | 4.81 | (1.53, 1.45) (2.44, 4.13) | ✓（用到 56%）|
-   | 8 | 10.52 | (2.67, 5.03) (5.12, 11.05) (5.22, 38.01) | ✗ 超 5 倍 |
-   | 16 | 25.16 | (3.98, 10.35) (8.41, 30.33) (13.03, 155.42) (15.14, 314.75) | ✗ 超 43 倍 |
-
-   **交叉点在 $\gamma\approx3$**（2026-09-16 更正：原稿写"$\gamma\approx5$"与自己的数据矛盾——表里 $\gamma\approx5$ 的两个窗口已分别超 1.5 倍和 5 倍；按拟合 $0.6\gamma^{2.3}=7.4$ 解得 $\gamma\approx3.0$）。另原稿把**窗口**的 $\gamma$（5.22、15.14）写成了**运行**的 $\gamma_{\max}$（10.5、25.2），已订正为：$\lambda_0/20$ 支撑到 $\gamma\approx3$，$\gamma\approx5$ 已欠 1.5–5 倍，$\gamma\approx15$ 欠 43 倍。
-   对 $\gamma\gtrsim1.4$ 的四个端点拟合得 **$\omega_c/\omega_0\approx0.6\,\gamma^{2.3}$**，故分辨要求 **$N\gtrsim1.6\,\gamma^{2.3}$**（$\gamma=10$ 需 $\lambda_0/320$、$\gamma=25$ 需 $\lambda_0/2600$）。
-4. **三次表述的最终裁决**（记下来免得再绕）：初稿"随 $\gamma^2$ 增长"**数量级对但机制错**（不是激光的多普勒上移，是电子自身横向运动随 $\gamma$ 变快变尖）；随后我的"更正"$\omega_c=0.75a_0$、与 $\gamma$ 无关**只在低 $\gamma$ 成立**（$a_0=2$ 处偶然吻合 7%）；**实测给出 $\gamma^{2.3}$**。教训：这类标度必须测，两头推测都靠不住。
-   **边界**：本扫描里 $a_0$ 与 $\gamma$ 是相关的（$\gamma_{\max}\approx1.2a_0$），所以拟合的是**沿 LWFA 工作线**的 $\omega_c(\gamma)$，不是把 $a_0$ 与 $\gamma$ 分离；同一 $\gamma$ 附近的两个窗也可差 3.4 倍（$\gamma\approx5$ 处 11.05 vs 38.01），故指数有散布。
-
-**行动结论**：$\lambda_0/20$ 的生产算例可做 BK 的 $\gamma\approx3$ 段（**交叉点 $\gamma\approx3$**，见 (d)3：$\gamma\approx5$ 已欠 1.5–5 倍）；LWFA 关注的 $\gamma=10$–$100$ 需要 $dx=\lambda_0/320$–$\lambda_0/2600$，**不可行**。所以 PIC 集成的落点重新确认为**弱相对论激光等离子体的红外 BK 谱**，这次是测量支撑的。
-
-**附：磁场/回旋驱动另算（2026-09-16 更正，原稿漏了反冲因子）。** 那里 $\rho\propto\gamma^2$ 与 $\omega_c\propto\gamma^3\Omega$ 部分相抵，要求是"每轨道若干格"，但**必须含 $\omega_c$ 处的 $\varepsilon/\varepsilon'$**：$\chi=0.5$ 时 $\omega_c/\varepsilon=1.5\chi=0.75$ 与 $\gamma$ 无关，故该处 $f=\varepsilon/\varepsilon'=4$。用模块 `adequacy` 复算 $\gamma=10$、$\chi=0.5$ 圆轨道（$32\times8$ 全球面锥；$\beta$ 恒定在 $\gamma=10$，即**最有利**情形，探针 `/tmp/probe_app.py`）：$dx=0.234$（原稿数字，轨道直径 1692 格）在 $\omega_c$ 处 margin $=3.06$，**欠分辨**；$0.5\omega_c$ 处 0.60 才可用。要到 margin $<1$ 需 $dx\approx0.076$ ⇒ 轨道直径 **5211 格**、盒子约 $5500^2$，**格点数约为原稿估计的 9.5 倍**。（曾写 margin $=3.38$、$0.669$：那是把 $\pm3\%$ 的能量起伏代入局域能量路径的取值。恒定 $\beta$ 给 3.06，而能量起伏只会让它更大——$\pm2\%$ 时 3.26、$\pm10\%$ 时 4.63——所以 3.06 是下限。）所以"$\gamma=10$ 可行、10 分钟一趟"应读作"只到 $0.5\omega_c$ 可行"。
-
-**(e) 与 V8 的关系（容易被误读，特此写明）**：**V8 与本节不矛盾，两者约束的是不同的事。**
-
-- **V8 回答**："*给定*一条采样充分的轨迹，模块算的谱对不对？" 实测 γ=10、χ=0.5、一圈 $N_t=7960$，margin 从 $\delta=0.05$ 的 0.052 到 $\delta=0.5$ 的 **0.997**——**恰好卡在采样极限上**（其 docstring 的 $N_t>4m$、$m=1990$ 就是这个）。它之所以通过，是因为**解析轨迹没有网格、$N_t$ 是自由参数**。**V8 的结论完全有效**：模块在 γ=10 上的实现（前因子、反冲相位、$\omega^2/\gamma^2$ 项）正确到 0.1–0.3%。
-- **本节回答**："*PIC* 能不能给出采样充分的轨迹？" 这里 $dt$ 被 CFL 锁在 $dx$ 上，才有 (d) 的代价问题。
-
-**(f) 顺带发现的两个真实缺陷**：
-
-- **移动窗口会毁掉全程记录**：用 `MovingWindow` 的那次运行里，末态最热的两个粒子的 id 在**前 857/1070 步完全找不到**（只在最后 213 步出现）。记录器**正确报错**（"gap"），但我写的报错文案把原因归给了"跨 rank 迁移"，**归错了**——真实原因是该粒子在那段时间不存在/不可达。**要用本记录器就得关掉移动窗口**（或把盒子开到脉冲不出界），本次检查即是这么做的。
-- **`record_adequacy` / `formation_time` 对"含长静止段"的记录给出垃圾值**：它们用 $\text{median}\lvert\mathrm d\mathbf v/\mathrm dt\rvert$，而本例 65% 的记录是静止段，中位数被 $\sim10^{-31}$ 主导，$L/\tau_f$ 报 $10^{-18}$（应为 $O(10)$–$10^2$）。**修法：只在相互作用窗口上评估**（本次检查即如此），或让 `_curvature_rate` 对静止段稳健。**（2026-09-16 已修：取后者，见 §8.5。）**
-
-**行动结论**：PIC 集成的落点是**弱相对论（$\gamma\lesssim3$，见 (d)3 的交叉点）激光等离子体的红外 BK 谱**，而不是 LWFA 的高 $\gamma$ 谱。若目标物理需要 $\gamma\gg10$，则"BK 吃 PIC 轨迹"这条路在本分辨率下关闭，BK 只能继续作为**合成轨迹上的解析参照**（它已验证的结果都在那里）。
+1. **自洽恒等式不是外部判据**。厄米性、正性、两后端一致、在壳重合这类检查对**任意**反对称相位都成立——BUG-10 因此活了八天全绿。判别性判据必须是外部的：平移不变、退化为解析形式、与文献谱比对。（P-2 曾被标为"靠测试钉死"，那批测试全是相盲的。）
+2. **"某个近似可以丢"必须实测**。本项目已连续三次出现方向判断被实测推翻：P-3（$-4922$ 不是边界项而是混叠）、P-4（漏的是软光子端不是高 $\omega$）、§3.5（带状截断）。先做单变量截断曲线，再谈实现。
+3. **判据要调用模块函数，不要手抄公式**。§3.1 的 $\omega$ 因子与 BUG-11 是同一个坑的两侧：手抄漏 $\omega$ 会让 margin 差 $1/\omega$（LWFA 尺度上报 $4\times10^4$ 而非 0.129）。
+4. **相消量会把误差放大**。双时间和在结构化谱上相消比 $10^4$–$10^7$，于是"在箱尺度上插值"、"逐点比较线间值"、"部分和收敛性"全都无意义——这类量必须按箱索引读、按峰值相对比较、或换成平滑窗。
 
 ---
 
-## 8.5 第三轮审查（2026-09-16）：§8.2–8.4 及其依赖代码的复核——全部本机复现
+## 8. 附录：复现命令与探针
 
-> **修复状态（2026-09-16，同日）**：四条代码缺陷**已全部修复**，每条都补了一个在修复前会失败的测试。回归 **72 例全过**（63 BK + 9 记录器），V1–V8 逐位不变。修复提交：
->
-> | 缺陷 | 提交 | 复现证据（我独立复跑） |
-> |---|---|---|
-> | BUG-10 局域相位不平移不变 | `835b651` | $\omega=0.2$ 处 3696.68 → 平移后 9005.39；路径积分形式两次都是 3149.49。修复后平移不变 $1.3\times10^{-14}$，恒能量退化回到 $1.2\times10^{-13}$ |
-> | BUG-11 局域守卫漏 $\omega$ | `a86e02b` | 比值精确等于 $1/\omega$（$\omega=0.5$ 报 2.1548 应 1.0774；$\omega=5$ 报 7.0030 应 35.0149）；LWFA 尺度报 42459 应 0.129。修复后 LWFA 尺度报 0.0000 |
-> | BUG-12 跨 rank 合并空操作 | `39499da` | `mpirun -n 2` 各追一个自己拥有的粒子：`n_samples = [6, 0]`、第二粒子 x 全 NaN。修复后 `[6, 6]`；**已验证该测试在修复前的代码上以 `assert [6, 0] == [6, 6]` 失败** |
-> | BUG-13 `window=` 补偿错误 | `0578948` | `_shift_right/_shift_left` 只改 `ipatch_x/x0/xaxis` 与 `fields.x0/xaxis`；参数已删除 |
->
-> 下面"§8.2–8.4 文本与数字问题"中**我核实属实**的已一并更正（见各处注记）；#7 我**部分保留意见**（见该条）。探针脚本未入库。
+```bash
+# 仓库根目录：/home/panda/lambdapic/lambdapic
+python -m lambdapic.core.qed.baier_katkov.validation          # V1–V8，约 6 s
+python -m pytest tests/test_baier_katkov.py -n 0 -q           # 回归（-n 0 必须写）
+python -m lambdapic.core.qed.baier_katkov.validation_plot     # 重新生成 validation_summary.png
+python -m lambdapic.core.qed.baier_katkov.coherence           # 圈间相干测量（§3.4）
+python example/bk-testbed.py                                  # 静磁场 PIC 测试台
+```
 
-> 范围：`banding.py`、`trajectory.py`、`integrator.py` 局域能量路径、`callback/trajectory.py`、以及 §8.2–8.4 的推导与数字。基线：pytest 66 例全过、V1–V8 未动。探针脚本见 `/home/panda/lambdapic/temp/`。
-
-### 代码缺陷（按严重度）
-
-**BUG-10（严重，物理错误）：局域能量相位不具平移不变性。** 当前 $\Phi_{ij}=\omega[f_j x_j - f_i x_i]$（$x=t-\mathbf n\cdot\mathbf r$）在 $f_i\ne f_j$ 时随坐标原点变化：$x\to x+c$ 使 $\Phi\to\Phi+\omega c\,(f_j-f_i)$。实测（能量变化圆轨道 $\gamma_0=10$、$\delta=0.3$、$N_t=400$、$\mathbf n=\hat{\mathbf x}$，`double_time_integral_batch(..., energy=)`，`checks="ignore"`）：
-
-| $\omega$ | 原坐标 | 时间平移 +5000 | 空间平移 $+300\hat{\mathbf x}$ |
-|---|---|---|---|
-| 0.2 | 3696.7 | 9005.4 | — |
-| 0.5 | 2102.0 | 4238.4 | −123.7 |
-| 1.0 | 14718.1 | −2190.2 | — |
-
-固定能量路径在同样平移下逐位不变。原因：$f_jx_j-f_ix_i=\int f\,\mathrm dx+\int x\,\mathrm df$，第二项依赖**绝对**坐标；所谓"差分稳定形式" $\bar f\,\Delta x+\Delta f\,\bar x$ 只是同一式子的代数改写，$\bar x$ 就是绝对光锥坐标。PIC 记录的 $t$、$\mathbf r$ 以盒子原点计（自然单位下 $10^6$–$10^8$），喂进来时该项主导。**修法**：改为路径积分 $\Phi_{ij}=\omega\sum_{k=i}^{j-1}\tfrac12(f_k+f_{k+1})(x_{k+1}-x_k)$——预计算逐 $(\omega,\mathbf n)$ 的累积相位 $\Psi$，$\Phi_{ij}=\omega(\Psi_j-\Psi_i)$——平移不变、$f$ 为常数时**精确**退化到固定形式、反对称性（厄米上三角）保留。用此形式复算上表得 3149.5 / −272.2 / −14207.2，平移后逐位不变。现有 7 个局域能量测试（退化、dot≡trace、numba≡numpy、厄米、正性、经典模式能量无关）**全都测不出这一项**，需补"平移不变"用例。§8.3(g)#5 引用的"ω=1 处差 4.5 倍"出自此相位，**作废**。§8.3(e)"让 `banding.py` 支持局域能量相位"须等本项修完。
-
-**BUG-11：局域能量模式的采样守卫漏了 $\omega$ 因子。** `double_time_integral_batch`、`double_time_integral`（numpy 分支）、`BKIntegrator.adequacy` 三处把 `f.max(axis=1)`（无量纲的 $\varepsilon/\varepsilon'$）当作 `sampling_margin` 的 `factor` 传入，而固定路径传的是 $\omega\varepsilon/\varepsilon'$。margin 偏差恰为 $1/\omega$：上面的轨道上 $\omega=0.5$ 报 2.15（应 ≈1.08，固定路径 1.05）、$\omega=2$ 报 2.80（应 ≈5.6，固定路径 5.0）；LWFA 尺度（$\omega=\omega_0\approx3\times10^{-6}$ 自然单位）报 **42459**（固定路径 0.129）。后果：局域模式下每条 PIC 记录都触发 `SamplingWarning`，`checks="raise"` 直接拒算；$\omega>1$ 时反而漏报混叠。这正是 §8.3(d) 警告的"手抄公式漏 ω"，只是长在模块自己身上。修法：三处改为 `omega * f.max(axis=1)`（BUG-10 修成路径积分后相位率就是 $\omega f(t)(1-\mathbf n\cdot\mathbf v)$，此因子无歧义）。
-
-**BUG-12（严重）：`TrajectoryRecorder._merge` 的跨 rank 合并是空操作。** 合并条件是 `fill = ~isfinite(out_t) & isfinite(rt)`，但 `_call` 对每个被追踪粒子都写 `t = sim.time`（不管它在不在本 rank），$t$ 永远有限，`fill` 恒为 False。实测 `mpirun -n 2`、用 `ids=` 各追踪 rank0 / rank1 一个粒子、6 步：`n_samples = [6, 0]`，rank1 粒子的 x 全 NaN。§8.3(g) 的"跨 rank 迁移逐字节相同"之所以成立，是因为自动选择取**全局最小 id**，而 id 高位是 rank，选到的全是 rank0 粒子，合并路径从未被触发。后果：从 rank0 迁到 rank≥1 的粒子被**静默**截成前缀（`_valid_prefix` 不报错），一直在 rank≥1 的粒子静默得到 `n_samples = 0`，rank≥1 迁回 rank0 才报 gap。修法：按 x 的有限性合并，或不在本 rank 时把 t 写 NaN；并补一个显式 `ids=` 跨 rank 的 MPI 用例。
-
-**BUG-13：`window=` 补偿是错的（§8.3(g)#11 可以结案）。** `MovingWindow._shift_right/_shift_left` 只改 `p.x0`、`p.xaxis`、`p.fields.x0/xaxis`（±Lx），粒子的 x 从不平移；`_fill_particles_2d/3d` 里的 `x_list` 只给**新建**粒子赋 xaxis 上的实验室坐标；粒子交换按 patch 的 xmin/xmax（实验室系）分配。所以记录到的 x **已经是实验室系**，再加 `total_shift` 会注入一个随时间线性增长的假位移（其初值还是 `patch_Lx` 而非 0）——等效于叠加一个 ≈c 的假速度，直接毁掉相位 $\mathbf n\cdot(\mathbf r_2-\mathbf r_1)$。修法：删掉该参数（或改为报错）。
-
-**本轮确认仍在，其一当日已修：**
-
-- ~~`_curvature_rate` 用全记录中位数~~ **已修（2026-09-16，同轮）**：含静止段的记录上中位数被死样本的 $\sim10^{-31}$ 抖动主导（复现：65% 静止的 $\gamma=10$、$\chi=0.5$ 圆弧，测得 $2\times10^{-31}$，真值 $\chi/\gamma^2=5\times10^{-3}$），连带 `record_adequacy`、`formation_time`、`default_theta_max`、`emission_half_angle` 全部失真、`RecordLengthWarning` 误报。改为**只在运动样本上取中位数**（速度低于峰值 $10^{-3}$ 的样本剔除，且只统计**两端都在动**的区间，避开静止→运动的瞬变；阈值相对，量纲不变）。无静止段的记录逐位不变，V1–V8 输出逐位相同，回归 72→73 例。**残余（有意保留）**：`record_adequacy` 的 $L$ 仍是整条记录的跨度，而死段不贡献辐射却计入长度，故含长死段的记录上这个比值偏**宽**；要严格评估仍应裁到相互作用窗口（§8.4(b) 的检查即如此）。
-- **仍待修**：记录起点静止（$\beta_0\approx0$）时 `compute_spectrum` 的默认轴退到 $\hat{\mathbf z}$、`velocity_swing` 相对噪声方向计算，只靠 $5/\gamma_0$ 的地板把锥角顶到 $\pi$ 才没出错——喂 PIC 记录时应显式给 `axis=` 并裁到相互作用窗口。
-
-### §8.2–8.4 文本与数字问题
-
-1. **§8.4 附（磁场"可行"）漏了反冲因子。** $\chi=0.5$ 时 $\omega_c/\varepsilon=1.5\chi=0.75$ 与 $\gamma$ 无关，故 $\omega_c$ 处 $\varepsilon/\varepsilon'\approx4$ 对所有 $\gamma$ 成立；§8.3(d) 的 3.17 含此因子，附录的"$1.9\gamma^3\beta f$"没含。用模块 `adequacy` 复算 $\gamma=10$、$\chi=0.5$ 圆轨道：附录的 $dx=0.234$（直径 1692 格）在 $\omega_c$ 处 margin $=3.06$（$0.5\omega_c$ 处 0.60）；要到 1.0 需 $dx\approx0.076$、直径 ≈5200 格、盒子 ≈5500²，格点数约为附录估计的 10 倍。"γ=10 可行、10 分钟一趟"应改为"只到 $0.5\omega_c$ 可行"，或按 $dx\approx0.076$ 重估代价。
-2. **§8.4(d)3 的"支撑到 γ≈5"与自身数据和拟合矛盾。** 表中 $\gamma\approx5$ 的两个窗口（$a_0=8$：5.12→11.05、5.22→38.01）已分别超 1.5 倍和 5 倍；"γ≈10 欠 5 倍、γ≈25 欠 43 倍"把**窗口**的 γ（5.22、15.14）写成了**运行**的 $\gamma_{\max}$。按拟合 $0.6\gamma^{2.3}=7.4$ 解得交叉点 $\gamma\approx3.0$。两处"行动结论"（γ≲5 / γ≲3–5）、§9 与文首摘要应统一为 γ≈3。
-3. **§8.4(a) 的 $0.372N\omega_0$ 是 $\theta_{max}=\pi$ 的最坏情形。** `sampling_margin` 只对传入的方向取 max；前向锥（$\theta_{max}\approx$ 摆角 $+3\theta_c$）下 $\max|1-\mathbf n\cdot\mathbf v|\approx1-\beta\cos\theta_{max}$，对本节的激光抖动电子（摆角 ~1 rad）判据约放宽 2–5 倍（交叉 γ 上移约 1.5–2 倍）；对尾场里小摆角的俘获电子（贝塔管几何，$\theta\sim K/\gamma$）放宽可达 $\gamma^2$ 量级。§8.4"γ=10–100 不可行"是对**激光抖动电子、全球面锥**测的，不能直接推到 LWFA 真正关心的尾场俘获电子。
-4. §8.4(c) 表用的是 $N\approx3\gamma^2$（75/300/7500/30000）而标题写 $2.7\gamma^2$；且 (c) 已被 (d)2–3 取代却未标"作废"。§8.4 有两个"(e)"。
-5. §8.2(d) 的加速比自相矛盾：保留对数占比 16%/47%/79% 对应加速 6.2/2.1/1.3 倍，正文却写 $T/(4B\tau_f)=3.12/B$（差 2 倍）；结论方向不变。
-6. §8.2 的判据取在**谱线中心**（**已补记于 §8.2 末**），而带状截断按定义丢掉的正是圈间相干，线中心永远不可能收敛——这证明了"带状截断不能做 n 圈相干扫描"，但**没有**证明"对粗粒化谱不是受控近似"：(c) 中 $\Gamma$ 与 n 无关恰是非相干极限的特征，$\Gamma$ 对 B 敏感是硬矩形窗的振铃。对非周期 PIC 记录重启本项时，观测量应取频率平均谱，并用平滑窗代替矩形窗。
-7. §8.2(c)(d)(e) 与 (b) 出自同一批 `/tmp/band_*.py`（仍在 /tmp，未入库），(b) 已因分箱 bug 作废，(c)–(e) 的数字未用 `banding.py` 复算，应同样标"待复算"。**（部分保留：见 §8.2 末的复核补记——(c)/(d) 走 `masked_dE` 的逐对掩码路径、不经分箱，其结构结论保留；数字仍待复算。）**
-8. §8.3(b) 仍写 `cumulative[i]` = "lag ≤ lag[i]"，与 §8.3(g)#1 修正后的"<"矛盾。
-9. §9 的带状截断行仍引用作废表的"W=3T 偏离 245%"。
-10. §8.2 结论 3 的"周期性分块需 O(n) 次单圈积分"可以省掉：严格周期时 $M(d)=e^{-i\phi d}M(0)$、$\phi=\omega fT$，故 $I_n=M(0)\,\sin^2(n\phi/2)/\sin^2(\phi/2)$（连续时间下严格），只需一次单圈全和——就是 n=1 的谱，(f) 的分块稳定性障碍随之消失（网格端点半权重造成的偏差即 §8.1 测到的 +0.30%）。
-
-### 已核对无误
-
-§8.4(a) 推导与实测 margin 自洽（0.129 ↔ 1/7.44 与 $1+\beta=1.91$）；§8.4(b) $\omega_c=4.7\omega_0$、(d)3 拟合及 $1.6\gamma^{2.3}$ 换算；§8.3(c) 的 $\nabla\times\mathbf B\ne0$ 论证；§8.3(d) 的 3.17（含反冲因子）；§8.2(a) 的块相位 $2\pi md$；`banding.py` 的分箱边界、厄米加倍、经典反冲模式、前因子与积分器一致；记录器 `start` 阶段 x、u 同时刻（推进器是 x 半步–u 整步–x 半步）；`as_trajectory_si` 的 u 透传与 λPIC 的 $u=\gamma\beta$ 约定一致（`boris.py`：`inv_gamma = 1/sqrt(1+u²)`）。
-
----
-
-## 8.6 `banding.py` 接上局域能量相位 + 真实加速记录上的判据复算（2026-09-16）
-
-> 承接 §8.3(e) 的解封项：BUG-10（§8.5）修好后，"探针不支持局域相位"这个阻塞消失。本节把路径积分相位接进探针，然后在**真实加速记录**上重做 §8.2 的判据。
-
-**(a) 实现**：`lag_profile` 去掉 `NotImplementedError`，局域分支复用积分器自己的两个助手——`integrator._local_vertex_arrays`（逐顶点 $A,B$）与 `phase.local_phase_tables`（累积表 $T,\mathbf R$）——所以箱里累加的就是积分器实际计算的那个核与相位，而不是另写一份。固定分支逐位未动（实测 4 个 total 值改动前后完全相同）。三条新用例：与积分器逐方向求和一致（两相位 × 两核，rel $10^{-10}$）、恒定能量退化到固定分支（逐箱 $10^{-10}$）、**平移不变**（$+5000$ 与 $+300\hat{\mathbf x}$ 后 total 与逐箱曲线不动）。**注**：退化解例必须用**在壳**轨迹——$b_1\!\cdot\!b_2-1$（局域）与 $(\mathbf b_1-\mathbf b_2)^2$（固定）两种约定**只在** $|\mathbf b_i|^2=1-m^2/\varepsilon_i^2$ 时等价，拿"变 $\gamma$ 轨迹 + 恒定 $\varepsilon$"去比会离壳、假性差 9%。
-
-**(b) 记录**：生产 LWFA（`example/lwfa.py`，$a_0=2$、$dx=\lambda_0/20$、$500\times800$），**关掉移动窗口**（它会在运行中新建粒子：这次运行里粒子数从 351 万涨到 366 万，末态最热的电子只有 213 步历史，正是 §8.4(f) 记的那件事），500 步 = 46.7 fs。最热电子 $\gamma:1.00\to2.39$，前 **69%** 静止，相互作用窗口 = 末 155 步。判据自检：$\omega_0$ 处 margin $=0.129$、$7.4\omega_0$ 处 $0.952$（网格上限 $0.372\times20=7.44\,\omega_0$ ⇒ margin $1$），与 §8.4(a)(b) 已发表的值逐位吻合；本电子 $\omega_c\approx5.6\,\omega_0$。
-
-**(c) 判据复算——仍然不收敛（局域相位）：**
-
-| $\omega/\omega_0$ | margin | $L/\tau_f$ | 相消比 | $C(1\tau_f)$ | $C(3\tau_f)$ | $C(10\tau_f)$ | $C(0.5L)$ | $C(0.9L)$ |
-|---|---|---|---|---|---|---|---|---|
-| 0.3 | 0.039 | 4.7 | $2.0\times10^1$ | 4.83 | 0.80 | 1.00 | −2.52 | 1.36 |
-| 1.0 | 0.129 | 7.0 | $1.4\times10^2$ | −8.47 | 3.05 | 1.00 | −5.84 | −0.70 |
-| 3.3 | 0.425 | 10.4 | $2.8\times10^3$ | 13.35 | 18.48 | −0.48 | 11.01 | 4.83 |
-| 7.4 | 0.952 | 13.6 | $3.4\times10^3$ | 2.56 | −5.75 | 1.74 | 2.66 | 0.26 |
-
-$C(W)/C(\infty)$ 在 $1$–$3\tau_f$ 处乱跳、含负值、量级 $O(1)$–$O(10)$；**即使丢掉 90% 的滞后范围也不收敛**（$C(0.9L)$ 只有 $0.26$–$4.83$）。相消比 $2\times10^1$–$3.4\times10^3$，比闭合轨道的 $2.5\times10^5$ 温和得多，但"被截掉的不是尾巴而是相消项"这一点相同。**所以 §8.2 的"不做"决定在真实非周期记录上、用正确相位复核后维持**——而且这次不受 §8.5 #6 那条"线中心判据"质疑：记录是非周期的，没有线中心可言，观测量就是它自己。**边界（诚实记录）**：这个窗口长 1.12e7 自然单位 $=5.4$ 个激光周期，满足 §8.2 结论 2 要求的"宽带"，但**不满足"长度 $\gg T$"**（闭合轨道测试台是 $4T$，这里 $5.4T$，同一量级）；"$\gg T$" 极限仍未直接测到，但截至目前没有任何支持截断的证据，而每一次更接近真实的测试都指向同一结论。
-
-**(d) 顺带在真实记录上量清了"漏传 `energy`"的代价**（§8.3(g)#5 的解封复算）。固定模式取 $\varepsilon$ 为窗口内某个值，与局域（唯一正确）比较：
-
-| 核 | $\varepsilon=\gamma_{\max}=2.39$ | $\varepsilon=\bar\gamma=1.40$ | $\varepsilon=\gamma_{\min}=1.00$ |
-|---|---|---|---|
-| `dot` | 1.0000 | 1.0000 | 1.0000 |
-| `trace` | **17.1** | **2.20** | **0.96** |
-
-两点结论：**(i)** 软光子带里 $\omega/\varepsilon\sim10^{-6}$，`dot` 核的系数几乎不含 $\varepsilon$，所以固定回退在这一档**看不出问题**——旧报的"$\omega=1$ 处差 4.5 倍"（§8.5 已作废）来自 $\omega/\varepsilon\sim0.1$ 的合成算例，不能外推到生产记录；**(ii)** `trace` 核下固定模式的答案**随任意选的 $\varepsilon$ 摆动 17 倍**，而局域形式给唯一值——因为固定模式对这条 $\gamma:1\to2.4$ 的记录**必然离壳**（核假定 $|\mathbf b_i|^2=1-m^2/\varepsilon_i^2$），它自己两个核在离壳处就互相矛盾。所以"漏传 `energy`"的后果与核、频率都有关，不能用一个倍数概括。
-
-**(e) 附：`_curvature_rate` 修复在真实记录上的前后**（§8.4(f) 第二条）。整条记录（69% 静止）：修复前 $L/\tau_f=\mathbf{2.8\times10^{-19}}$，修复后 $\mathbf{15.4}$——与 §8.4(f) 记的 $10^{-18}$ 同源，现在这个数落在它该在的量级上。
-
----
-
-## 9. 行动清单速查
-
-| 优先级 | 事项 | 工作量 | 对应章节 |
-|---|---|---|---|
-| ~~P0~~ ✅ | ~~修 BUG-1（recoil 静默忽略）~~ 已完成 2026-09-08 | — | §2 |
-| ~~P0~~ ✅ | ~~修 BUG-2/3/4（校验与守卫）~~ 已完成 2026-09-08 | — | §2 |
-| ~~P0~~ ✅ | ~~修 BUG-5（前因子 4π）+ pytest 回归~~ 已完成 2026-09-08 | — | §2, §7-A |
-| P0 | 补设计文档/文献出处（架构/函数说明已补：README.md 重写为中文详细文档 2026-09-09；**文献出处已补 2026-09-11：与 BKS 专著 (2.25)/(2.40)/(2.42) 的编号对照已建立，含三处方法差异记录，见 §3**；剩余：物理推导设计文档 `Baier-Katkov.md`） | 0.5–1 d | §3 |
-| ~~P1~~ ✅ | ~~量子同步辐射交叉验证~~ 已完成 2026-09-08（BK/精确 0.997–1.001；顺带修 BUG-6 trace 核） | — | §4 P-1, §7-B |
-| ~~P1~~ ✅ | ~~采样守卫 + 记录长度诊断（P-3 重新诊断）~~ 已完成 2026-09-11（`SamplingWarning`/`RecordLengthWarning`，所有入口默认开；$-4922$ 实为采样混叠，Nyquist 判据 $N_t>4m$） | — | §4 P-3, §7-B |
-| ~~P1~~ ✅ | ~~P-4 自适应锥角 + 两板网格 + 角度守卫~~ 已完成 2026-09-11（原文方向判断有误：软光子端被截而非高 $\omega$；旧默认在 $0.75$ rad 弧上漏 92–99.7%，新默认 ←1.6%。V1–V8 逐位不变，回归 40→48 例） | — | §4 P-4, §7-B |
-| P2 | 端点亏损修正：**收敛性研究已做（2026-09-11）——$\tau_f/L$ 标度未获证实，$c/L$ 模型不可用**（§4 P-3 (d)）。若继续，需先建宽带/真实 PIC 非重复测试台，靶值由 $L\to\infty$ 收敛性定义 | 3–5 d | §4 P-3 |
-| ~~P2~~ ✅ | ~~局部能量核 ε(t)~~ 已完成 2026-09-09（`Trajectory.energy` + 逐顶点核/相位，双后端；固定路径未动）；**相位 2026-09-16 修正**（`835b651`，BUG-10：原两点/差分形式不具平移不变性，改路径积分累积表 `local_phase_tables`。当时"钉住"它的 7 个用例全是相盲的自洽检查——恒能量与经典模式下错误相位逐位相同、其余对任意反对称相位都成立） | — | §7-B, §4 P-2, §8.5 |
-| ~~P2~~ ✅ | ~~Numba 化~~ 已完成 2026-09-08（约 140×） | — | §5 |
-| ~~P2~~ ⛔ | ~~带状截断（$O(N_t N_\omega)$）~~ **已判定不做（2026-09-14；数字 2026-09-16 更正）**：判据实验（§8.2）显示滞后分布不衰减（$|M(d)|/|M(0)|=1$ 精确）、截断曲线小于整条记录都不收敛、朴素带破坏 $n^2$ 且 $\Gamma$ 由 $B$ 任意决定、梳状带既不准也不省（加速比 $6.25/B$，即 1.25–6×，无渐进收益）。原"是相干扫描钥匙"的说法作废。**注意 §8.2(b) 的 $C(W)$ 表已作废、加速比原写的 $3.12/B$ 差 2 倍** | — | §8.2 |
-| P2 | 周期性分块（$O(N_tN_1)$ 的 $n$ 圈扫描）：**§8.2 后 $n$ 圈扫描仅剩的候选**。前置障碍：单圈块和是量级 $10^5$ 的相消量、直算不稳定（§8.2 (f)）；上网格须与 $T$ 可约 | 2–3 d（含稳定性） | §8.2 |
-| ~~P2~~ ✅ | ~~圈间相干判据实验~~ 已完成 2026-09-11（新文件 `coherence.py` + `coherence_plot.py`）：$n^2$ 律（偏差恒 $+0.30\%$，与 $n$ 无关）、$\Gamma=n$、线宽 $\propto1/n$、线能量 $\propto n$ **三个标度同时成立**。**未做**：带状截断不破坏 $n^2$ 的验证（$\gamma=5$ 下代价可承受，未启用截断） | — | §8.1 |
-| ~~P1~~ ✅ | ~~第二轮审查新缺陷~~ **已完成 2026-09-12**：BUG-7 角度边界诊断指向靠轴节点（实测把承担 38.6% 的边缘节点报成 0.033，掩盖了唯一该报警的信号）、BUG-8 $\omega=0$ 静默 NaN、BUG-9 `Trajectory.charge/mass` 死字段（字段已删，改 `TypeError`）、`Trajectory` 缺 time 单调性与有限性校验、metadata 在 `split` 非法时谎报网格。补 **7 个 pytest 用例**钉住行为，回归 **51→58 例**全过、V1–V8 数值逐位不变 | 0.5 d | §2.5 |
-| ~~P1~~ ✅ | ~~提交未落库的成果~~ 已完成 2026-09-14：拆成 `411a63f`（09-11 成果）+ `2563766`（本轮审查修复）两个提交，工作区干净 | — | §2.5 |
-| P3 | 单位适配器 + 轨迹记录回调 + 系综求和 | 2–3 d | §7-D |
-| ~~P3~~ ✅ | ~~绘图改 LaTeX + 期刊风~~ 已完成 2026-09-14：两个绘图模块的公式全部改为 mathtext（`mathtext.fontset="stix"`，配 Times 正文），并统一为**纯白期刊风**（`set_publication_style()`：白底、无网格、四边框轴、刻度朝内、字号 12、dpi 300）。**三条实测硬约束**：(1) 含美元定界符的**行**里汉字变豆腐块（同行缺字 5 / 拆行 0），混合标签用 `_stack()` 拆行，新增 `_check_labels(fig)` 在 `savefig` 前扫描并抛错；(2) `font.family="serif"` + `font.serif=[列表]` **不逐字形回退**（缺字 28），必须让 `font.family` 本身是具体字体列表（缺字 0）；(3) ✓/✗（U+2713/U+2717）在衬线与中文字体里都没有，字体栈末尾需要 DejaVu Sans 作符号回退。另修掉 3 处字号放大后暴露的排版碰撞（V5 / V6 / V1‑V2‑V7 注记、coherence 顶栏） | 0.5 d | README §6.10 |
-| ~~P3~~ ✅ | ~~PIC 集成最小闭环 + 真实轨迹判据~~ **已完成 2026-09-15，并经第二轮对抗复核修正**：`as_trajectory_si` 适配器（含 `energy` 入口）、`TrajectoryRecorder` 回调（挂 `start`）、`banding.py` 判据、`example/bk-testbed.py` 静磁场测试台、8 例新测试。**更正 §8.2(b) 被作废的表**；**作废 (c) 的 $g\ne0$ 两行**（静态场梯度不是麦克斯韦解，见 §8.3(c)）。有效结论只有一条：**真实 PIC 闭合轨道记录上截断曲线不收敛**。另修 11 处缺陷（§8.3(g)） | 1.5 d | §8.3 |
-| ~~P2~~ ⛔ | ~~非周期测试台~~ **已判定（2026-09-16，§8.6）**：`banding.py` 的局域相位阻塞已消失，"宽带"来源也不能再靠静态场梯度（§8.3(c)），于是在**真宽带构型**上直接测了——生产 LWFA 的真实加速记录（$\gamma:1\to2.4$、5.4 个激光周期）上截断曲线同样不收敛，带状截断对非周期记录一并关闭。**残余**：长度 $\gg T$ 的极限仍未直接测到（本记录只有 $5.4T$） | — | §8.3, §8.6 |
-| ~~P2~~ ✅ | ~~判据检查：真实生产轨迹上 BK 能不能用~~ **已完成 2026-09-16**（§8.4）：网格决定的可用频段 $\omega_{max}=0.372\,N\,\omega_0$；生产 LWFA（$\gamma_{\max}=2.42$）的实际发射在 $\omega_c\approx1.4$–$4.7\,\omega_0$，**判据通过** | 0.5 d | §8.4 |
-| ~~P2~~ ✅ | ~~测高 $\gamma$ 标度~~ **已完成 2026-09-16**（§8.4(d)）：$a_0$ 从 2 扫到 16，实得 **$\omega_c/\omega_0\approx0.6\gamma^{2.3}$**、分辨要求 $N\gtrsim1.6\gamma^{2.3}$。**交叉点 $\gamma\approx3$**（2026-09-16 订正，原写 γ≈5–10 与自身数据矛盾）：$\lambda_0/20$ 支撑到 $\gamma\approx3$，$\gamma\approx5$ 欠 1.5–5 倍、$\gamma\approx15$ 欠 43 倍。三次表述（$\gamma^2$ / $\gamma$ 无关 / $\gamma^{2.3}$）由测量裁决 | 0.5 d | §8.4 |
-| P4 | 在线事件采样 / 自旋分辨核 / NUFFT | 周级 | §7-D/E |
-| ~~P0~~ ✅ | ~~BUG-10 局域能量相位不平移不变~~ **已完成 2026-09-16**（`835b651`）：相位改路径积分 $\Phi_{ij}=\omega(\Psi_j-\Psi_i)$，补"平移不变"用例（修复前该项失败）。修复后平移不变到 $1.3\times10^{-14}$ | — | §8.5 |
-| ~~P0~~ ✅ | ~~BUG-12 记录器跨 rank 合并空操作~~ **已完成 2026-09-16**（`39499da`）：按 x 有限性合并，补 `ids=` 跨 rank MPI 用例（已验证其在修复前以 `assert [6, 0] == [6, 6]` 失败） | — | §8.5 |
-| ~~P1~~ ✅ | ~~BUG-11 局域模式采样守卫漏 ω + BUG-13 删 `window=`~~ **已完成 2026-09-16**（`a86e02b` / `0578948`）：三处 `f.max` → `omega*f.max`；`window=` 参数删除（§8.3(g)#11 结案）。回归 **66→72 例全过**、V1–V8 逐位不变 | — | §8.5 |
-| ~~P1~~ ✅ | ~~`_curvature_rate` 对静止段稳健化~~ **已完成 2026-09-16**（§8.4(f) 第二条 / §8.5）：只统计速度高于峰值 $10^{-3}$ 且**两端都在动**的区间，消除静止段对中位数的污染（复现 65% 静止：$2\times10^{-31}$ → $\chi/\gamma^2$）；补一个修复前失败的用例，V1–V8 逐位不变、回归 72→73 例 | — | §8.4(f), §8.5 |
-| P2 | `compute_spectrum` 记录起点静止时（$\beta_0\approx0$）的默认轴：现退到 $\hat{\mathbf z}$、`velocity_swing` 相对噪声方向算，只靠 $5/\gamma_0$ 的地板把锥角顶到 $\pi$ 才没出错 | 0.5 d | §8.5 |
-| ~~P1~~ ✅ | ~~§8.4/§8.2 文本与数字更正（§8.5 第 1–10 条）~~ **已完成 2026-09-16**：磁场附录补反冲因子（γ=10 需 $dx\approx0.076$、直径 5211 格；margin 3.06 为恒定 β 下限）、交叉点改 $\gamma\approx3$（文首/§8.4 两处结论/§9 同步）、§8.4(a) 注明 $0.372N\omega_0$ 是**全球面锥最坏情形**（前向锥可放宽 2–5 倍，尾场俘获电子可达 $\gamma^2$）、(c) 表标作废、合并两个 (e)、§8.2 加速比改 $6.25/B$、§8.2 补两条可信度补记（(b)(e) 待复算、(c)(d) 掩码路径保留；线中心判据的边界）、§8.3(b) 改 "<"、§8.3(g)#5 的 4.5 倍作废并重测、§8.3(g)#11 结案、§9 引用同步 | — | §8.5 |
-| ~~P2~~ ✅ | ~~`banding.py` 支持局域能量相位~~ **已完成 2026-09-16**（§8.6）：局域分支复用积分器自己的 `_local_vertex_arrays` + `phase.local_phase_tables`（箱里累加的就是实际算的核与相位），固定分支逐位未动；补三条用例（与积分器逐方向求和一致、恒能量退化、平移不变）。真实记录上复算判据：**仍不收敛**；顺带量清固定 ε 回退的代价随核与频率变（`trace` 核下随任意选的 ε 摆动 **17 倍**，`dot` 核在软光子带里看不出差别） | — | §8.6 |
-
+- 跑 PIC 前设 `LAMBDAPIC_CHECK_UPDATE=0`，否则 `Simulation.run()` 会因 PyPI 版本检查阻塞约 9 s（本机无外网）。
+- **探针脚本不入库**：§3.5 的带状截断探针、§3.1/§3.3 的采样与相位探针都在 `/tmp`，属于一次性实验。要在新会话里复现，按本节的判据与数字重写即可。
+- 环境、`-n 0` 的原因、公式渲染约定等见仓库根目录 `CLAUDE.md`。

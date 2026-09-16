@@ -2,11 +2,12 @@
 
 The double sum costs ``O(Nt^2)`` per frequency.  The roadmap originally proposed
 truncating it to pairs with ``|t2 - t1| <~ B tau_f``, which would make it
-``O(Nt)``.  ``REVIEW_AND_ROADMAP.md`` section 8.2 showed that this is invalid on
+``O(Nt)``.  ``REVIEW_AND_ROADMAP.md`` section 3.5 showed that this is invalid on
 a closed orbit -- the pair correlation does not decay there, so a band removes
-cancelling terms rather than a decaying tail.  Whether it is valid for an
-aperiodic record (what a PIC actually produces) is still open, and these
-functions are the measurement that decides it.
+cancelling terms rather than a decaying tail -- and later on a real aperiodic
+PIC record as well, so banded truncation is **not implemented**.  These
+functions remain as the measurement that decided it, and as the tool to re-run
+if the verdict is ever revisited (section 4.4 states the preconditions).
 
 Two quantities matter, and the second is the one that gates the first:
 
@@ -18,7 +19,7 @@ Two quantities matter, and the second is the one that gates the first:
 
 ``cancellation``
     ``sum|terms| / |value|`` at that frequency.  On a closed orbit's line centre
-    this is about ``2.5e5`` (section 8.2(f)), which means the answer is a small
+    this is about ``2.5e5`` (section 3.5, item 5), which means the answer is a small
     residue of large cancelling terms -- and any partial sum is then dominated
     by quadrature and round-off rather than by physics.  Report it *before*
     interpreting any curve.
@@ -54,7 +55,7 @@ __all__ = ["lag_profile", "truncation_curve", "probe_directions"]
 def probe_directions(theta_max=np.pi, n_theta=32, n_phi=1, axis=(0.0, 0.0, 1.0)):
     """Canonical direction grid for the probe.
 
-    Defaults match the closed-orbit measurement in section 8.2 so a new record
+    Defaults match the closed-orbit measurement in section 3.5 so a new record
     can be compared against the published table with the same quadrature.
     """
     return cone_directions(np.asarray(axis, dtype=np.float64), theta_max,

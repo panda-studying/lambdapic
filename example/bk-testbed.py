@@ -1,6 +1,6 @@
 """Testbed: record a *real* PIC trajectory for the Baier--Katkov module.
 
-The banded-truncation verdict in ``REVIEW_AND_ROADMAP.md`` §8.2 is decisive only
+The banded-truncation verdict in ``REVIEW_AND_ROADMAP.md`` §3.5 is decisive only
 on a closed orbit; the aperiodic case -- which is what a PIC actually produces --
 could not be settled because the synthetic record used there was barely four
 turns long.  This script builds a cheap but adequate testbed: **one electron

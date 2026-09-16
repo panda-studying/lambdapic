@@ -31,7 +31,7 @@ That factor ``n`` is the whole signal: **the line-centre spectral density of a
 coherently radiating electron exceeds the LCFA continuum by the number of turns
 it has radiated for.**  Equivalently the line *energy* (density x width) scales
 as ``n`` -- which is why ``L * dP/domega`` is the wrong target for a multi-turn
-record (roadmap section 4, P-3(d)).
+record (roadmap sections 3.4 and 4.1).
 
 Why V8 cannot see this
 ----------------------
@@ -58,7 +58,7 @@ linearly with the turn count (the Nyquist bound ``N_t > 4 m`` applies to the
 *record*, and the record is ``n`` turns long), so a naive scan costs
 ``sum_n n**2``.  The defaults below are sized to run in single-digit minutes;
 ``line_center_only=True`` trims the scan to the line centres when only
-``Gamma(n)`` is wanted.  Banded truncation (roadmap section 5, not implemented)
+``Gamma(n)`` is wanted.  Banded truncation (roadmap section 3.5: decided against)
 would turn the ``n**2`` into ``n``.
 
 Two honest limitations, both checked by the measurement rather than assumed:

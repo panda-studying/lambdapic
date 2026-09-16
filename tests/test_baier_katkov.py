@@ -557,7 +557,8 @@ def test_local_energy_validation(varying_circle):
 # The probe bins the pairs of the same double sum the integrator computes, on
 # the same directions, so its *total* is an external check -- and the local
 # phase had none: the probe raised NotImplementedError until the accumulated
-# tables made it expressible (section 8.3(e) of the roadmap).
+# tables made it expressible (the roadmap's banded-truncation "do not
+# implement" verdict, section 3.5).
 # --------------------------------------------------------------------------
 def test_banding_probe_matches_the_integrator_on_both_phases():
     """``dE_domega`` from the probe equals the integrator's own sum, both phases.
