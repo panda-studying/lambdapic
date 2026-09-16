@@ -211,7 +211,7 @@ $$I = \sum_{i,j} w_i w_j\, N(t_i, t_j)\, e^{-i\Phi(t_i, t_j)}, \qquad w = \text{
   直线记录 $\Omega_{\rm eff}=0\Rightarrow\tau_f=\infty$，判据返回 $\infty$（**不适用**：直线段的真空减除已消去直线部分，不产生截断亏损）。
 - 逐 $\omega$ 的数值也可直接取用：`BKIntegrator.adequacy(omega_grid, dirs)`，并写入 `Spectrum.metadata["sampling_margin"]` / `["record_adequacy"]`。
 - **`AngularConvergenceWarning`（方向网格欠分辨）**：由 `compute_spectrum` 触发——把 `n_theta`/`n_phi`（与内板节点数）加倍，在**承载谱量最多**的 $n_{probe}$ 个频率上重算角积分，**相对峰值**的变化超过 `integrator.ANGULAR_RTOL`（2%）即报警（`checks="raise"` 时抛异常，`"ignore"` 时完全跳过、`metadata["angular_convergence"]` 为 `nan`）。**这是唯一要额外算一遍的守卫**，开销约 $4n_{probe}/N_\omega$ 的角积分。触发阈值与实测精度边界一致（$\gamma=5,\chi=0.5$ 圆、$\delta=0.3$ 谐波、`axis=z`：$n_\theta=12$ 时 $\mathrm dE/\mathrm d\omega$ 比精确值高 4.6%、报警；$n_\theta=16$ 时高 0.0%、静默）。
-  - **为什么是"峰值相对"而不是逐点相对**：谱密度有零点。结构化轨道上相邻谐波**之间**的值是相消残差，实测在那里角网格微扰会带来 >140% 的变化，而**线中心**只动 $10^{-5}$（见 §10 Test B）。逐点相对判据会对每条线谱误报；按峰值归一才能界定"谱整体"的误差。
+  - **为什么是"峰值相对"而不是逐点相对**：谱密度有零点。结构化轨道上相邻谐波**之间**的值是相消残差，实测在那里角网格微扰会带来 >140% 的变化，而**线中心**只动 $10^{-5}$（见 [§6.12](#612-coherencepy--coherence_plotpy--test-b圈间相干) 与 `REVIEW_AND_ROADMAP.md` §3.4）。逐点相对判据会对每条线谱误报；按峰值归一才能界定"谱整体"的误差。
   - **已知局限**：该守卫假设 $\omega$ 网格上每个点都是可解释的谱值。**线谱**（闭合轨道多圈）不满足这一点——此时应把 $\omega$ 网格限制在线中心附近，或由驱动器屏蔽这一条警告并**自带一个针对线中心的收敛检查**（`coherence.verify_angular_convergence` 就是这么做的）。
 - **免费诊断（无需重算）**：`metadata["angular_edge_fraction"]` 是最外层 $\theta$ 节点承担的角积分份额（大 ⇒ 锥角接近截断，该抬高 `theta_max`）；`metadata["velocity_swing"]` 与 `metadata["emission_half_angle"]` 给出记录的速度摆幅与逐 $\omega$ 的锥角需求；`metadata["theta_max_auto"]` / `["theta_split"]` / `["n_inner"]` 记录本次实际用的网格。
 
@@ -467,7 +467,7 @@ $$\frac{dW}{dt\,d\delta} = -\frac{\alpha}{\varepsilon}\Big[\int_z^{\infty}\!\mat
 - `turn_spectrum(gamma, chi, delta, turns)`：在反冲移动谐波 $\omega_m$ 附近取 $\omega$ 窗口（窗口半宽按预测线宽自适应，保证线宽始终由约 8 个网格点承载），算 $n$ 圈闭合圆轨道的谱。
 - `lcfa_reference(delta, chi, epsilon, T)`：单圈 LCFA 连续谱密度 $T\,\mathrm dP/\mathrm d\omega$（量子同步辐射速率）。
 - `verify_angular_convergence(...)`：**线中心**密度在 $n_\theta$ 与 $2n_\theta$ 下的相对变化——通用角守卫在线谱上会被线间相消残差带偏（见 §3.7 局限），所以驱动器屏蔽那一条警告并自带这个检查。
-- `scan_turns(...)` / `format_table(rows)` / `main()`：扫圈数、给出三个标度的实测指数。
+- `scan_turns(...)` / `format_table(rows)` / `main()`：扫圈数、给出三个标度的实测指数。**实测结果表**（$n^2$ 律、$\Gamma=n$、线宽 $\propto1/n$、线能量 $\propto n$，含边界与未解项）见 `REVIEW_AND_ROADMAP.md` §3.4。
 - `coherence_plot.main()`：6 面板 —— 谱线浮现、$n^2$ 律、线宽 $\propto1/n$、LCFA 判别量 $\Gamma=n$、线能量 $\propto n$、参数与判据汇总。
 
 ### 6.13 `examples/bk_single_particle.py` — 示例
@@ -554,25 +554,22 @@ python -m pytest tests/test_baier_katkov.py -n 0 -q -m "not slow"   # 跳过全�
 
 ## 10. 已知限制与路线图
 
-按 `REVIEW_AND_ROADMAP.md` 的编号：
+**用法限制**一览（每条给出模块内章节；判据的实测依据、判定过程与未决项都在 [REVIEW_AND_ROADMAP.md](REVIEW_AND_ROADMAP.md)——那是跨会话的唯一事实来源，本节不复述它的结论）：
 
-- **P-3 有限记录边界辐射（2026-09-11 重新诊断：守卫已加，物理修正未做）**：原诊断（"硬截断端点辐射会污染整个谱"、以 $\mathrm dW/\mathrm d\omega=-4922$ 为例）经复核**不成立**——那个负值是**采样混叠**（该处 $N_t=512$，而 Nyquist 需 $N_t>4m\approx7960$）；充分采样后闭环在 $\delta=0.5$ 处对精确谱的比值为 1.0007。真正的失败模式在**低 $\omega$／记录短于形成时间**：亏损局域在记录两端的 $\sim\tau_f$ 邻域（整数圈精确，非整数圈按缺失的偏圈亏损），$L\lesssim\tau_f$ 时谱被低估甚至变负（实测表见 [§3.7](#37-适用性守卫采样混叠记录长度与角度分辨)）。**形成长度窗口不是它的解**：窗口只会进一步削减积分、加重亏损（实测：$\tau_w=100$ 把 $\delta=0.5$ 的 $-62.8$ 压到 $-0.057$，同时把一次谐波的 $+4.10$ 压到 $-0.139$）；窗口的正确定位是性能（带状截断）与非均匀场退相干建模。**已实现**：两个适用性守卫（`SamplingWarning` / `RecordLengthWarning`，默认开，见 [§3.7](#37-适用性守卫采样混叠记录长度与角度分辨)）。**未做**：端点亏损的物理修正。2026-09-11 的收敛性研究（`REVIEW_AND_ROADMAP.md` §4.1）表明**原计划的 $\tau_f/L$ 标度不成立**：锐谱线处 $d\mathrm E/d\omega\propto L^2$（相干，与 $\Delta t$ 无关），故多圈记录不能拿 $L\cdot\mathrm dP/\mathrm d\omega$ 作靶；换到宽带（chirped）轨迹后 $\text{deficit}\cdot L/\tau_f$ 在 $-0.6$～$2.9$ 间游走、并变号，同样不是常数。结论：**不要基于 $c/L$ 模型做端点修正**；若继续需先建真正非重复的测试台，靶值由 $L\to\infty$ 收敛性定义。
-- **Test B 圈间相干（2026-09-11 已完成，`coherence.py`）**：LCFA 是局域非相干的速率积分，**没有相位**；BK 保留相位，所以闭合轨道上各圈**相干叠加**。定量预言是"线中心密度 / LCFA 连续谱密度 $=n$"。实测（$\gamma=5,\chi=0.5,\delta=0.5$，闭环，$n=1,2,4,8,16$）：
+| 限制 | 应对 |
+|---|---|
+| 双时间积分是 $O(N_t^2N_\omega N_{dir})$；numba 约 140× 但不改标度 | 控制记录长度与频率网格。带状截断（$O(N_tN_\omega)$）**已判定不做**——截断掉的是相消项而非衰减尾巴（路线图 §3.5） |
+| 采样不足时输出的不是谱，而是**采样伪影**（可任意大、任意符号） | 三个守卫默认开（[§3.7](#37-适用性守卫采样混叠记录长度与角度分辨)）；生产流程用 `checks="raise"` 直接拒算。判据见 [§3.5](#35-数值稳定性与采样判据) |
+| 记录短于形成时间（$L/\tau_f\lesssim1.5$）时谱被低估、甚至变负，**低 $\omega$ 端最先出问题** | 同上；该情形的物理修正**未做**（靶值问题未解决，路线图 §4.1） |
+| 固定轴锥面只在摆幅远小于锥角时有效；**闭环轨道必须显式给 `axis=`** | 默认自适应锥角（[§3.4](#34-角度积分)）；闭环／大摆角传 `axis=` 或加大 `n_theta`，守卫会报警而非静默给错值 |
+| 记录起点静止（$\beta_0\approx0$）时 `compute_spectrum` 的默认轴退到 $\hat{\mathbf z}$ | 喂 PIC 记录时显式给 `axis=`，并裁到相互作用窗口（路线图 §4.3） |
+| 局域能量模式要求能量与动量**在壳一致**（$\varepsilon_i=m\sqrt{1+\lvert\mathbf u_i\rvert^2}$），模块不校验 | 用 `Trajectory.local_energy()` 的在壳回退值，或自证一致（[§2.4](#24-局域能量推广-p-2)） |
+| 输入轨迹必须**无辐射反冲**，否则双计量子反冲 | PIC 里关掉 radiation 再录轨迹（[§1](#1-模块定位与范围)、路线图 §6.2） |
+| 变能量记录**必须传 `energy`**，否则静默按固定 $\varepsilon$ 评估 | `as_trajectory_si(..., energy=γ)`；漏传的代价与核、频率都有关（[§2.4](#24-局域能量推广-p-2)、路线图 §3.3） |
+| `TrajectoryRecorder` 遇上**移动窗口**时，末态最热电子可能只有末尾几百步历史（窗口在运行中新建粒子） | 关掉移动窗口，或把盒子开到脉冲不出界（路线图 §6.1） |
+| 准经典：$\chi\lesssim1$；自旋与极化只做求和／平均 | 自旋分辨需要新核，**未实现** |
 
-  | $n$ | 线中心密度 /（$T\,\mathrm dP/\mathrm d\omega$） | $n^2$ | $\Gamma$ | $n$ | FWHM/线间距 | $1/n$ | 线能量比 | $n$ |
-  |---|---|---|---|---|---|---|---|---|
-  | 1 | 1.0030 | 1 | 1.0030 | 1 | 不可测 | 1.000 | 0.834 | 1 |
-  | 2 | 4.0120 | 4 | 2.0060 | 2 | 0.478 | 0.500 | 1.981 | 2 |
-  | 4 | 16.0480 | 16 | 4.0120 | 4 | 0.227 | 0.250 | 4.009 | 4 |
-  | 8 | 64.1920 | 64 | 8.0240 | 8 | 0.1115 | 0.125 | 8.021 | 8 |
-  | 16 | 256.7679 | 256 | 16.0480 | 16 | 0.0555 | 0.0625 | 15.97 | 16 |
-
-  **三个标度同时成立**：$n^2$ 律（偏差恒为 $+0.30\%$，与 $n$ 无关 ⇒ 指数精确为 2）、线宽 $\propto1/n$（实测常数 $0.444(\varepsilon/\varepsilon')/n$——朴素 Dirichlet 估计给它的两倍，该因子未解，故只报实测值）、线能量 $\propto n$。$n=1$ 就退化成 V8 的陈述，所以 **V8 是这条测量在 $n$ 轴上的零端点**；V8 看不见它是因为**一圈的 Dirichlet 核恒等于 1**（$\sin(nx)/\sin x$ 在 $n=1$ 时恒为 1），压根没有线结构，而 $\delta=0.5$ 处一圈线宽 $\Omega$ 比线间距 $0.25\Omega$ 还大 4 倍。图见 `coherence_summary.png`（不与 `validation_summary.png` 混）。详见 [REVIEW_AND_ROADMAP.md](REVIEW_AND_ROADMAP.md) §3.4。
-- **P-4 默认锥角（2026-09-11 已解决：自适应锥角 + 两板网格 + 角度守卫）**：路线图原文的**方向判断有误**——它说"反冲使大 $\delta$ 处发射锥变宽"，实测正好相反：$\theta_c=(4/m)^{1/3}$ 随 $\omega$ **增大而变窄**（$\gamma=10,\chi=0.5$：$\theta_c\gamma$ 从 $\delta=0.02$ 的 4.6 降到 $\delta=0.7$ 的 0.95），被旧的固定 $5/\gamma$ 截掉的是**软光子端**——恰是本模块相对 LCFA 的核心价值区。第二个原因是**速度摆幅**（闭环 $2\pi$），旧默认完全忽略。**已实现**：`integrator.default_theta_max`（$\min(\pi,\text{swing}+3\max_\omega\theta_c)$，下限 $5/\gamma$）、`cone_directions` 的两板规则（$1/\gamma$ 内芯单独分组）、`AngularConvergenceWarning` 与 `angular_edge_fraction` 诊断，见 [§3.4](#34-角度积分)/[§3.7](#37-适用性守卫采样混叠记录长度与角度分辨)。**边界（诚实记录）**：固定轴锥面只在摆幅远小于锥角时有效；闭环轨道即使锥开到 $\pi$ 也需更大的 `n_theta` 或显式 `axis=`，守卫会报警而不是静默给错值。V1–V8 数值逐位不变（它们都显式传 `theta_max`，走历史单板路径）。
-- **性能**：$O(N_t^2)$ 双重和；numba 化已完成（约 140×），带状截断 $O(N_t N_\omega)$ **已判定不做**（`REVIEW_AND_ROADMAP.md` §3.5）。
-- **PIC 集成**：单位适配器（`trajectory.as_trajectory_si`）与轨迹记录回调（`callback/trajectory.py`）**已完成**；未做的是宏粒子权重系综求和、多轨迹批量、在线事件采样、自旋分辨核、NUFFT（`REVIEW_AND_ROADMAP.md` §2.1、§6.3）。
-- **文档债务（`REVIEW_AND_ROADMAP.md` §4.5，部分缓解）**：代码 docstring 引用的设计文档 `Baier-Katkov.md`（eq. 5.3/7.1/7.3/9.6、sec. 4.2 等编号）**尚不存在**——本 README 补齐了架构与函数说明，但物理推导与文献出处的设计文档仍待写；局域能量（sec. 4.2）的推导记录在 `REVIEW_AND_ROADMAP.md` §3.3。
-- **调用方责任**：能量历史与动量历史的在壳一致性、轨迹不含 LCFA 反冲（[§1](#1-模块定位与范围)）。
+**未实现的能力**：多粒子系综求和（调用方按 $w_i$ 加权）、多轨迹批量、FFT/NUFFT、在线事件采样、自旋分辨核、LCFA/BK 混合模型。
 
 ---
 

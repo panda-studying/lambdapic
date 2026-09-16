@@ -227,6 +227,7 @@ $\beta_0\approx0$（PIC 记录开头激光还没到）时默认轴退到 $\hat{\
 - **`test_record_adequacy_tracks_the_open_arc_deficit` 没有检验它声称的物理**：三条轨迹的采样密度恒为 1200/圈，$L/\tau_f$ 严格 $\propto$ 圈数，断言退化成"阈值区间 + 构造上必然成立的单调性"；docstring 里那张谱亏损表（0.89@0.9 圈 … $-0.19$@0.4 圈）**从未被执行**。
 - **`test_prefactor_constant` 是变更探测器**：断言 `PREFACTOR == fine_structure/(4π²)`，即 `integrator.py` 的定义式本身，不检验归一化；真正钉绝对归一化的是 V8 与 Schwinger 对照。
 - **README §6.5 漏参数**：`compute_spectrum` 的签名说明里没有 `checks`。
+- **README §6 缺 `banding.py` 一节**（编号从 6.10 直接跳到 6.12，空缺处本该是它）。它是探针而非用户 API，所以当初没写；但既然 §3.5 的结论由它支撑，至少该有一行条目指向它。
 
 ---
 
