@@ -72,8 +72,14 @@ def as_trajectory_si(t_si, x_si, u=None, energy=None, n_samples=None) -> Traject
         local-energy phase **only** when ``Trajectory.energy`` is set, and
         ``Trajectory.local_energy()`` — the on-shell ``gamma`` fallback — is
         never consulted by the integrator.  Omitting it therefore evaluates an
-        accelerating record at a *fixed* incident energy, silently (measured on
-        a 5->15 ramp: a factor 4.5 error in ``dE/domega`` at ``omega=1``).
+        accelerating record at a *fixed* incident energy, silently.  Measured
+        on the production LWFA record (``gamma`` 1.0 -> 2.4, interaction window
+        only), where the fixed fallback is additionally *off shell*: with the
+        ``dot`` kernel the two agree to 0.06% inside the resolvable band (its
+        coefficients are ``eps``-insensitive when ``omega/eps ~ 1e-5``), but
+        with the ``trace`` kernel they differ by factors of 0.46-17 — and the
+        fixed evaluation's own two kernels disagree there, which is the tell
+        that the local form is the only well-defined one on such a record.
     n_samples : int or array, optional
         Length of the valid prefix.  The recorder writes fixed-shape
         NaN-padded arrays so that a mid-record gap stays visible; slice to

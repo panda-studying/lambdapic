@@ -224,9 +224,12 @@ def _kernel_coefficients(kernel, omega, epsilon, eps_p, mass):
 def _local_vertex_arrays(kernel, omega, energy, phase, mass):
     """Per-(frequency, vertex) arrays ``A, B, f`` of the sec. 4.2 local form.
 
-    The pair kernel is ``N_ij = (A_ki + A_kj) + (B_ki + B_kj) (b_i . b_j - 1)``
-    and the pair phase ``Phi_ij = omega_k [ fbar (x_j - x_i) + df (x_j + x_i)/2 ]``
-    with ``x = t - n.r``, ``fbar = (f_ki + f_kj)/2``, ``df = f_kj - f_ki``.
+    The pair kernel is ``N_ij = (A_ki + A_kj) + (B_ki + B_kj) (b_i . b_j - 1)``.
+    The pair phase is the *accumulated* one,
+    ``Phi_ij = omega_k [(T_kj - T_ki) - n.(R_kj - R_ki)]``, built from these
+    ``f`` by :func:`phase.local_phase_tables` -- the endpoint form
+    ``omega [f_j x_j - f_i x_i]`` is not translation invariant for varying
+    ``f``, see that function.
 
     ``phase`` selects the per-vertex final-state energy: ``"recoil"`` ->
     ``eps'_i = eps_i - omega_k`` (BK); ``"classical"`` -> ``eps'_i = eps_i``
