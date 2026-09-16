@@ -492,6 +492,33 @@ def test_local_recoil_phase_rejects_a_varying_factor():
                           10.0, 10.0)
 
 
+def test_local_energy_sampling_margin_matches_the_fixed_path(varying_circle):
+    """The local-mode guard must use the phase rate ``omega * eps/eps'``.
+
+    It used to pass the dimensionless ``eps/eps'`` alone, which is off by
+    exactly ``1/omega``.  Consequences: for ``omega < 1`` it reports aliasing
+    that is not there (and under ``checks="raise"`` refuses to compute at all --
+    every PIC record, whose omega is ~1e-6 in natural units, reported a margin
+    of ~4e4 instead of 0.13), while for ``omega > 1`` it *misses* real aliasing.
+
+    A constant energy history makes the two paths' phase rates identical, so
+    their margins must agree.
+    """
+    traj, _, dirs, omegas = varying_circle
+    beta = traj.beta()
+    const = np.full(traj.n_samples, 10.0)
+    integrator = bki.BKIntegrator(
+        Trajectory(time=traj.time, position=traj.position,
+                   momentum=traj.momentum, energy=const),
+        Parameters(epsilon=10.0), checks="ignore")
+    for omega in omegas:
+        omega = float(omega)
+        fixed = bki.sampling_margin(traj.time, beta, dirs, np.array([omega]),
+                                    np.array([omega * 10.0 / (10.0 - omega)]))
+        local = integrator.adequacy([omega], dirs)[0]
+        assert float(local[0]) == pytest.approx(float(fixed[0]), rel=1e-12)
+
+
 def test_local_energy_validation(varying_circle):
     traj, _, dirs, _ = varying_circle
     args = (traj.time, traj.position, traj.beta())

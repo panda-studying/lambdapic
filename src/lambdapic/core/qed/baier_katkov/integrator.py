@@ -575,8 +575,13 @@ def double_time_integral_batch(time, position, beta, omega, dirs, epsilon, mass=
         energy = _check_local_energy(energy, time.shape[0], kernel, epsilon_prime)
         A, B, f = _local_vertex_arrays(kernel, omega, energy, phase, mass)
         T, R = _phase.local_phase_tables(time, position, f)
+        # the guard's ``factor`` is the phase rate, omega * eps/eps' -- the same
+        # quantity the fixed-energy path passes via _phase_factor.  Passing the
+        # dimensionless eps/eps' alone is off by exactly 1/omega (measured: it
+        # reported 2.15 where the true margin is 1.08 at omega = 0.5, and 42459
+        # instead of 0.129 at LWFA scales).
         _run_adequacy_checks(time, beta, dirs, omega,
-                             f.max(axis=1) if f.ndim > 1 else f,
+                             omega * f.max(axis=1) if f.ndim > 1 else omega * f,
                              epsilon, epsilon_prime, phase, energy, checks)
         if backend == "numpy":
             out = np.empty((omega.shape[0], dirs.shape[0]))
@@ -669,7 +674,8 @@ def double_time_integral(time, position, beta, omega, n, epsilon, mass=1.0,
         if backend == "numpy":
             _run_adequacy_checks(time_arr, np.asarray(beta, dtype=np.float64),
                                  np.atleast_2d(np.asarray(n, dtype=np.float64)),
-                                 np.array([omega]), f.max(axis=1), epsilon,
+                                 np.array([omega]),
+                                 np.array([omega]) * f.max(axis=1), epsilon,
                                  epsilon_prime, phase, energy, checks)
             position = np.asarray(position, dtype=np.float64)
             beta = np.asarray(beta, dtype=np.float64)
@@ -1285,7 +1291,8 @@ class BKIntegrator:
         if self.energy is not None:
             _, _, f = _local_vertex_arrays(self.params.kernel, omega_grid,
                                            self.energy, phase, self.params.mass)
-            factor = f.max(axis=1)
+            # omega * eps/eps': the phase rate, matching the fixed-energy branch
+            factor = omega_grid * f.max(axis=1)
             eps_ref = float(np.mean(self.energy))
             eps_prime_ref = (eps_ref - omega_grid) if phase == "recoil" else eps_ref
         else:
