@@ -418,6 +418,80 @@ def test_local_energy_classical_is_energy_independent(varying_circle):
         assert np.isclose(varying, const, rtol=1e-12, atol=0.0)
 
 
+def test_local_phase_tables_reduce_to_f_times_differences():
+    """Constant ``f``: the accumulated tables must give exactly ``f(t_i-t_0)``,
+    ``f(r_i-r_0)``.
+
+    This is the check that catches a wrong trapezoid weight.  The accumulated
+    phase is ``int f dx``, so the *time* integral weights the increment by
+    ``(f_m+f_{m+1})/2 * dt`` and the *space* integral by
+    ``(f_m+f_{m+1})/2 * dr``; reusing the time weight for the space part
+    rescales ``R`` by ``dt`` (the first version of this fix did exactly that,
+    and it made the constant-energy degeneracy fail by 66%).
+    """
+    from lambdapic.core.qed.baier_katkov import phase as ph
+
+    t = np.array([0.0, 1.0, 2.5, 4.0])
+    r = np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 0.0],
+                  [3.0, 2.0, 0.0], [3.0, 5.0, 0.0]])
+    T, R = ph.local_phase_tables(t, r, np.array([[2.0, 2.0, 2.0, 2.0]]))
+    assert np.allclose(T[0], 2.0 * (t - t[0]))
+    assert np.allclose(R[0], 2.0 * (r - r[0]))
+
+
+@pytest.mark.parametrize("backend", ["numpy", "numba"])
+def test_local_energy_phase_is_translation_invariant(varying_circle, backend):
+    """Moving the origin of the recorded coordinates must not change the result.
+
+    The endpoint form ``omega [f_j x_j - f_i x_i]`` (``x = t - n.r``) is *not*
+    invariant when the energy varies: ``x -> x + c`` shifts it by
+    ``omega c (f_j - f_i)``, and since that term weights the whole integrand the
+    spectrum depends on where the origin sits.  PIC records carry coordinates of
+    order 1e6-1e8 in natural units, so this dominated the phase.  The accumulated
+    form the integrator now uses depends on differences only.
+    """
+    if backend == "numba" and not HAS_NUMBA:
+        pytest.skip("numba backend not available")
+    traj, _, dirs, omegas = varying_circle
+    beta = traj.beta()
+    args = (beta, omegas, dirs, 10.0)
+    base = bki.double_time_integral_batch(
+        traj.time, traj.position, *args, backend=backend, energy=traj.energy)
+    shift_t = bki.double_time_integral_batch(
+        traj.time + 5000.0, traj.position, *args, backend=backend,
+        energy=traj.energy)
+    shift_r = bki.double_time_integral_batch(
+        traj.time, traj.position + np.array([300.0, 0.0, 0.0]), *args,
+        backend=backend, energy=traj.energy)
+    scale = np.max(np.abs(base))
+    # tolerance: the accumulated tables are sums of ~Nt increments, so they carry
+    # round-off ~Nt*eps*|Psi|; the phase is a *difference* of two such sums, so
+    # what matters is that round-off over the phase itself, which lands at the
+    # 1e-11 level here.  (The endpoint form was invariant to 1e-16 and wrong by
+    # O(1); this is the better trade.)
+    assert np.max(np.abs(shift_t - base)) < 1e-10 * scale
+    assert np.max(np.abs(shift_r - base)) < 1e-10 * scale
+    # the shift must have been large enough to matter for a non-invariant phase
+    assert 5000.0 > 100.0 * np.ptp(traj.time)
+
+
+def test_local_recoil_phase_rejects_a_varying_factor():
+    """The two-point helper cannot express the path integral: make it loud.
+
+    ``f_j x_j - f_i x_i`` is only correct when ``f`` is the same at both
+    vertices; with ``eps1 != eps2`` the caller must use the accumulated form.
+    """
+    from lambdapic.core.qed.baier_katkov import phase as ph
+
+    n = np.array([1.0, 0.0, 0.0])
+    with pytest.raises(ValueError, match="translation invariant"):
+        ph.local_recoil_phase(0.0, 1.0, 0.5, n, np.zeros(3), np.array([1.0, 0.0, 0.0]),
+                              10.0, 8.0)
+    # a constant factor is the one case the two-point form handles
+    ph.local_recoil_phase(0.0, 1.0, 0.5, n, np.zeros(3), np.array([1.0, 0.0, 0.0]),
+                          10.0, 10.0)
+
+
 def test_local_energy_validation(varying_circle):
     traj, _, dirs, _ = varying_circle
     args = (traj.time, traj.position, traj.beta())

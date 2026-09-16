@@ -302,18 +302,19 @@ def _double_sum_numpy(time, position, beta, n, factor, kernel, epsilon, omega,
     return total
 
 
-def _double_sum_numpy_local(time, position, beta, n, omega, A, B, f, chunk):
+def _double_sum_numpy_local(time, position, beta, n, omega, A, B, T, R, chunk):
     """Full-square numpy double sum for the local-energy kernel (one omega).
 
-    ``A, B, f`` are the per-vertex ``(Nt,)`` arrays of
-    :func:`_local_vertex_arrays` for this frequency.  The phase is evaluated
-    in the difference-stable form
-    ``Phi = omega [ fbar (dx) + df (x1 + x2)/2 ]`` with ``x = t - n.r``.
+    ``A, B`` are the per-vertex ``(Nt,)`` kernel coefficients for this frequency
+    and ``T, R`` the cumulative phase tables of :func:`phase.local_phase_tables`
+    (``(Nt,)`` and ``(Nt, 3)`` here).  The phase is the accumulated one,
+    ``Phi_ij = omega [(T_j - T_i) - n.(R_j - R_i)]`` -- see that function for
+    why an endpoint expression is not translation invariant.
     """
     nt = time.shape[0]
     w = trapz_weights(time)
-    x = time - position @ n          # (Nt,)  light-cone coordinate t - n.r
     dot = beta @ beta.T              # (Nt, Nt)  b_i . b_j
+    nR = R @ n                       # (Nt,)  n . R_i
 
     total = 0.0 + 0.0j
     for start in range(0, nt, chunk):
@@ -322,11 +323,8 @@ def _double_sum_numpy_local(time, position, beta, n, omega, A, B, f, chunk):
         Bij = B[idx][:, None] + B[None, :]
         N = Aij + Bij * (dot[idx] - 1.0)
 
-        dx = x[None, :] - x[idx][:, None]
-        xavg = 0.5 * (x[None, :] + x[idx][:, None])
-        fbar = 0.5 * (f[idx][:, None] + f[None, :])
-        df = f[None, :] - f[idx][:, None]
-        Phi = omega * (fbar * dx + df * xavg)
+        Phi = omega * ((T[None, :] - T[idx][:, None])
+                       - (nR[None, :] - nR[idx][:, None]))
 
         K = N * np.exp(-1j * Phi)
         total += np.einsum("i,ij,j->", w[idx], K, w)
@@ -415,21 +413,21 @@ if _numba is not None:
     from numba import njit, prange
 
     @njit(cache=True)
-    def _accumulate_row_local(i, time, w, beta, nr, nb, omega, A, B, f,
-                              acc, psi, chi):
+    def _accumulate_row_local(i, time, w, beta, nr, nb, omega, A, B, T, R, dirs,
+                              acc):
         """Add row ``i`` (``j >= i``) of the local-energy double sum.
 
         Pair kernel ``N_ij = (A[k,i]+A[k,j]) + (B[k,i]+B[k,j]) (b_i.b_j - 1)``
-        and pair phase ``Phi = omega_k [ fbar psi_d + df chi_d ]`` with
-        ``psi_d = dt - (nr[j,d] - nr[i,d])`` (difference form) and
-        ``chi_d = tavg - (nr[j,d] + nr[i,d])/2`` (energy-variation term,
-        vanishes for a constant recoil factor).  Off-diagonal pairs are
-        counted twice (Hermitian symmetry, preserved because ``N`` is
-        symmetric and ``Phi`` antisymmetric under ``i <-> j``).
+        and pair phase ``Phi_ij = omega_k [(T[k,j]-T[k,i]) - n_d.(R[k,j]-R[k,i])]``
+        -- the accumulated form of :func:`phase.local_phase_tables`, which is
+        translation invariant (an endpoint expression ``omega[f_j x_j - f_i x_i]``
+        is not, when the recoil factor varies).  Off-diagonal pairs are counted
+        twice (Hermitian symmetry: ``N`` is symmetric and ``Phi`` antisymmetric
+        under ``i <-> j``).
         """
         nt = time.shape[0]
         nk = omega.shape[0]
-        nd = psi.shape[0]
+        nd = nr.shape[1]
         ti = time[i]
         wi = w[i]
         bix = beta[i, 0]
@@ -437,26 +435,26 @@ if _numba is not None:
         biz = beta[i, 2]
         for j in range(i, nt):
             tj = time[j]
-            dt = tj - ti
-            tavg = 0.5 * (tj + ti)
             wij = wi * w[j]
             if j > i:
                 wij *= 2.0
             dot = bix * beta[j, 0] + biy * beta[j, 1] + biz * beta[j, 2]
-            for d in range(nd):
-                psi[d] = dt - (nr[j, d] - nr[i, d])
-                chi[d] = tavg - 0.5 * (nr[j, d] + nr[i, d])
             x = dot - 1.0
             for k in range(nk):
                 wN = wij * ((A[k, i] + A[k, j]) + (B[k, i] + B[k, j]) * x)
-                fbar = 0.5 * (f[k, i] + f[k, j])
-                df = f[k, j] - f[k, i]
                 om = omega[k]
+                dT = T[k, j] - T[k, i]
+                r0 = R[k, j, 0] - R[k, i, 0]
+                r1 = R[k, j, 1] - R[k, i, 1]
+                r2 = R[k, j, 2] - R[k, i, 2]
                 for d in range(nd):
-                    acc[k, d] += wN * np.cos(om * (fbar * psi[d] + df * chi[d]))
+                    dR = (r0 * dirs[d, 0] + r1 * dirs[d, 1] + r2 * dirs[d, 2])
+                    acc[k, d] += wN * np.cos(om * (dT - dR))
+        _ = tj
 
     @njit(parallel=True, cache=True)
-    def _double_sum_batch_local(time, w, beta, nr, nb, omega, A, B, f, block):
+    def _double_sum_batch_local(time, w, beta, nr, nb, omega, A, B, T, R, dirs,
+                                block):
         nt = time.shape[0]
         nk = omega.shape[0]
         nd = nr.shape[1]
@@ -465,19 +463,17 @@ if _numba is not None:
         partial = np.zeros((nblocks, nk, nd))
         for ib in prange(nblocks):
             acc = np.zeros((nk, nd))
-            psi = np.empty(nd)
-            chi = np.empty(nd)
             i0 = ib * block
             i1 = min(i0 + block, half)
             for ii in range(i0, i1):
                 # rows ii and nt-1-ii together hold nt-1 off-diagonal pairs,
                 # so every iteration carries the same amount of work
-                _accumulate_row_local(ii, time, w, beta, nr, nb, omega, A, B, f,
-                                      acc, psi, chi)
+                _accumulate_row_local(ii, time, w, beta, nr, nb, omega, A, B,
+                                      T, R, dirs, acc)
                 jj = nt - 1 - ii
                 if jj != ii:
-                    _accumulate_row_local(jj, time, w, beta, nr, nb, omega, A, B, f,
-                                          acc, psi, chi)
+                    _accumulate_row_local(jj, time, w, beta, nr, nb, omega, A, B,
+                                          T, R, dirs, acc)
             partial[ib, :, :] = acc
         out = np.zeros((nk, nd))
         for ib in range(nblocks):
@@ -578,6 +574,7 @@ def double_time_integral_batch(time, position, beta, omega, dirs, epsilon, mass=
     if energy is not None:
         energy = _check_local_energy(energy, time.shape[0], kernel, epsilon_prime)
         A, B, f = _local_vertex_arrays(kernel, omega, energy, phase, mass)
+        T, R = _phase.local_phase_tables(time, position, f)
         _run_adequacy_checks(time, beta, dirs, omega,
                              f.max(axis=1) if f.ndim > 1 else f,
                              epsilon, epsilon_prime, phase, energy, checks)
@@ -587,7 +584,7 @@ def double_time_integral_batch(time, position, beta, omega, dirs, epsilon, mass=
                 for d in range(dirs.shape[0]):
                     out[k, d] = _double_sum_numpy_local(
                         time, position, beta, dirs[d], float(omega[k]),
-                        A[k], B[k], f[k], chunk,
+                        A[k], B[k], T[k], R[k], chunk,
                     ).real
             return out
         w = trapz_weights(time)
@@ -599,7 +596,8 @@ def double_time_integral_batch(time, position, beta, omega, dirs, epsilon, mass=
         return _double_sum_batch_local(
             time, w, beta, nr, nb, np.ascontiguousarray(omega),
             np.ascontiguousarray(A), np.ascontiguousarray(B),
-            np.ascontiguousarray(f), int(block),
+            np.ascontiguousarray(T), np.ascontiguousarray(R),
+            np.ascontiguousarray(dirs), int(block),
         )
 
     eps_p = _final_energy(omega, epsilon, epsilon_prime)
@@ -667,6 +665,7 @@ def double_time_integral(time, position, beta, omega, n, epsilon, mass=1.0,
         time_arr = np.asarray(time, dtype=np.float64)
         energy = _check_local_energy(energy, time_arr.shape[0], kernel, epsilon_prime)
         A, B, f = _local_vertex_arrays(kernel, np.array([omega]), energy, phase, mass)
+        T, R = _phase.local_phase_tables(time_arr, position, f)
         if backend == "numpy":
             _run_adequacy_checks(time_arr, np.asarray(beta, dtype=np.float64),
                                  np.atleast_2d(np.asarray(n, dtype=np.float64)),
@@ -676,7 +675,7 @@ def double_time_integral(time, position, beta, omega, n, epsilon, mass=1.0,
             beta = np.asarray(beta, dtype=np.float64)
             n = np.asarray(n, dtype=np.float64)
             return _double_sum_numpy_local(time_arr, position, beta, n, omega,
-                                           A[0], B[0], f[0], chunk)
+                                           A[0], B[0], T[0], R[0], chunk)
         out = double_time_integral_batch(time, position, beta, [omega], [n], epsilon,
                                          mass=mass, kernel=kernel, phase=phase,
                                          backend="numba", energy=energy, checks=checks)
