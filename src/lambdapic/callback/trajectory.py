@@ -45,16 +45,20 @@ itself, so it would be double counted.  The guard below checks the species'
 ``radiation`` flag and the collision operator, and can only be bypassed
 explicitly.
 
-Known limitation: :class:`~lambdapic.callback.utils.MovingWindow` shifts patches
-periodically and accumulates the displacement in ``total_shift``.  Pass the
-window callback as ``window=`` and that displacement is added back to the
-recorded ``x``.  **Whether this is actually needed is unverified**:
-``MovingWindow`` does read and write particle ``x`` (``callback/utils.py``,
-the ``x_list`` blocks), so a coordinate shift is plausible, but it was not
-established by a test -- and if the particle coordinates are already in the lab
-frame, the ``window=`` compensation would inject an offset that grows with the
-window displacement.  **Check against a moving-window run before trusting it.**
-A static-box run does not need it.
+Known limitation: :class:`~lambdapic.callback.utils.MovingWindow` deletes the
+particles it sweeps past, so a moving-window run has no full-length history for
+a particle it has overtaken -- and a particle identified as interesting at the
+*end* of a run may not have existed early on (measured on a production LWFA run:
+the hottest particles at the end were unfindable for the first 857 of 1070
+steps, which the gap check below reports).  Record with the window off, or pick
+particles that exist throughout.
+
+There is deliberately **no** ``window=`` compensation option: ``MovingWindow``
+only relabels patches (``p.x0``, ``p.xaxis``, ``p.fields.x0/xaxis``) and never
+touches particle coordinates, which are already in the laboratory frame.  Adding
+``total_shift`` back would inject a spurious displacement that grows in steps --
+equivalent to superimposing a fake velocity on the record and destroying the
+phase ``n.(r2 - r1)``.
 """
 
 from __future__ import annotations
@@ -94,9 +98,6 @@ class TrajectoryRecorder(Callback):
     select_after:
         Wait this many steps before choosing the tracked set -- useful when the
         interesting particles only appear once the drive has arrived.
-    window:
-        An optional ``MovingWindow`` instance whose ``total_shift`` is added
-        back to the recorded ``x`` (see the module docstring).
     allow_recoil:
         Bypass the non-radiating guard.  The resulting record is *not* valid
         input for the Baier--Katkov module; only for diagnostics.
@@ -112,7 +113,6 @@ class TrajectoryRecorder(Callback):
         max_particles: int = 1,
         ids: Optional[Sequence[int]] = None,
         select_after: int = 0,
-        window: Optional[Callback] = None,
         allow_recoil: bool = False,
     ) -> None:
         if not isinstance(interval, int) or isinstance(interval, bool):
@@ -139,7 +139,6 @@ class TrajectoryRecorder(Callback):
         self.max_particles = int(max_particles)
         self._explicit_ids = None if ids is None else np.asarray(ids, dtype=np.uint64)
         self.select_after = int(select_after)
-        self.window = window
         self.allow_recoil = allow_recoil
 
         self._tracked: Optional[np.ndarray] = None      # uint64, identical on all ranks
@@ -173,10 +172,9 @@ class TrajectoryRecorder(Callback):
                 return
             self._select(sim)
 
-        shift = 0.0 if self.window is None else float(self.window.total_shift or 0.0)
         x = np.full((self._tracked.size, 3), np.nan)
         u = np.full((self._tracked.size, 3), np.nan)
-        self._collect(sim, x, u, shift)
+        self._collect(sim, x, u)
 
         # ``t`` is written only where this rank actually holds the particle.  It
         # used to be filled with ``sim.time`` unconditionally, which made the
@@ -260,8 +258,13 @@ class TrajectoryRecorder(Callback):
             w = np.nanmax(np.vstack(gathered), axis=0)
         return w
 
-    def _collect(self, sim, x: np.ndarray, u: np.ndarray, shift: float) -> None:
-        """Fill ``x``/``u`` rows for the tracked ids found on this rank."""
+    def _collect(self, sim, x: np.ndarray, u: np.ndarray) -> None:
+        """Fill ``x``/``u`` rows for the tracked ids found on this rank.
+
+        Coordinates are taken as they are: the PIC stores them in the laboratory
+        frame, and no field configuration shifts them (see the module docstring
+        on ``MovingWindow``).
+        """
         for p in sim.patches:
             # re-fetch every time: extend()/prune() reallocate these arrays
             part = p.particles[self.species.ispec]
@@ -274,7 +277,7 @@ class TrajectoryRecorder(Callback):
                 if not hit.size:
                     continue
                 j = idx[hit[0]]
-                x[k] = (part.x[j] + shift, part.y[j], part.z[j])
+                x[k] = (part.x[j], part.y[j], part.z[j])
                 u[k] = (part.ux[j], part.uy[j], part.uz[j])
 
     # -- output ------------------------------------------------------------

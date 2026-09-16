@@ -205,3 +205,17 @@ def test_recorder_returns_the_path_it_actually_wrote(tmp_path):
     assert written == str(rec.path)
     assert rec.path.exists() and rec.path.suffix == ".npz"
     np.load(rec.path)          # must be loadable at the returned path
+
+
+def test_recorder_has_no_window_compensation(tmp_path):
+    """``MovingWindow`` relabels patches but never moves particles.
+
+    ``_shift_right``/``_shift_left`` touch only ``p.ipatch_x``, ``p.x0``,
+    ``p.xaxis`` and the field axis; particle coordinates stay in the laboratory
+    frame.  A ``window=`` option that added ``total_shift`` back would therefore
+    inject a stepwise spurious displacement -- equivalent to a fake velocity on
+    the record, which would destroy the phase ``n.(r2 - r1)``.  The parameter is
+    removed rather than left available.
+    """
+    with pytest.raises(TypeError):
+        TrajectoryRecorder(_sim()[1], tmp_path / "x.npz", window=object())
