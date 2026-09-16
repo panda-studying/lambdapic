@@ -25,6 +25,7 @@ import numpy as np
 import pytest
 
 from lambdapic.core.qed.baier_katkov import integrator as bki
+from lambdapic.core.qed.baier_katkov import banding as bkb
 from lambdapic.core.qed.baier_katkov import kernel as bkk
 from lambdapic.core.qed.baier_katkov import reference as bkr
 from lambdapic.core.qed.baier_katkov import validation as bkv
@@ -548,6 +549,87 @@ def test_local_energy_validation(varying_circle):
     with pytest.raises(ValueError):
         Trajectory(time=traj.time, position=traj.position, momentum=traj.momentum,
                    energy=np.full((traj.n_samples, 1), 10.0))
+
+
+# --------------------------------------------------------------------------
+# banding probe: the binned double sum, on both phases
+#
+# The probe bins the pairs of the same double sum the integrator computes, on
+# the same directions, so its *total* is an external check -- and the local
+# phase had none: the probe raised NotImplementedError until the accumulated
+# tables made it expressible (section 8.3(e) of the roadmap).
+# --------------------------------------------------------------------------
+def test_banding_probe_matches_the_integrator_on_both_phases():
+    """``dE_domega`` from the probe equals the integrator's own sum, both phases.
+
+    ``lag_profile`` weights the directions with ``dom`` and applies the
+    prefactor; ``double_time_integral_batch`` returns the bare sum per
+    direction.  Everything else -- trapezoid weights, upper triangle, kernel --
+    is the same in both, so the two must agree to round-off.
+    """
+    gamma0 = 10.0
+    traj_local, _ = energy_varying_circle(gamma0, 400, 0.3)
+    traj_fixed = Trajectory(time=traj_local.time, position=traj_local.position,
+                            momentum=traj_local.momentum)
+    omega = 0.5
+    dirs, dom = bkb.probe_directions(n_theta=6, n_phi=1)
+    for traj in (traj_fixed, traj_local):
+        for kernel in ("dot", "trace"):
+            params = Parameters(epsilon=gamma0, kernel=kernel)
+            prof = bkb.lag_profile(traj, params, omega, dirs, dom)
+            raw = bki.double_time_integral_batch(
+                traj.time, traj.position, traj.beta(), [omega], dirs,
+                params.epsilon, mass=params.mass, kernel=kernel,
+                energy=traj.energy, checks="ignore")
+            expected = (bki.PREFACTOR * omega ** 2 * params.charge ** 2
+                        * float(raw[0] @ dom))
+            assert prof["dE_domega"] == pytest.approx(expected, rel=1e-10)
+            assert prof["total"] == pytest.approx(prof["cumulative"][-1], rel=1e-14)
+
+
+def test_banding_local_energy_degenerates_to_fixed():
+    """A constant energy history gives the fixed-energy profile, bin for bin.
+
+    On shell ``|b_i|^2 = 1 - m^2/eps_i^2``, which is what makes the local
+    ``b_i.b_j - 1`` and the fixed ``(b_i - b_j)^2`` conventions the same
+    kernel; the trajectory must therefore be consistent with the energy
+    history it is given (the module does not check that for the caller).
+    """
+    traj, _ = circle(gamma=10.0, rho=200.0, n_samples=200)
+    const = Trajectory(time=traj.time, position=traj.position,
+                       momentum=traj.momentum,
+                       energy=np.full(traj.n_samples, 10.0))
+    dirs = np.array([[0.0, 0.0, 1.0], [0.0, 0.5, np.sqrt(0.75)]])
+    dom = np.array([1.0, 1.0])
+    for omega in (0.5, 2.0):
+        for kernel in ("dot", "trace"):
+            params = Parameters(epsilon=10.0, kernel=kernel)
+            fixed = bkb.lag_profile(traj, params, omega, dirs, dom)
+            local = bkb.lag_profile(const, params, omega, dirs, dom)
+            scale = np.max(np.abs(fixed["c"]))
+            assert np.max(np.abs(local["c"] - fixed["c"])) < 1e-10 * scale
+
+
+def test_banding_local_energy_is_translation_invariant(varying_circle):
+    """Shifting the recorded coordinates must not move the truncation curve.
+
+    This is the property the endpoint phase lacked (BUG-10): there the local
+    phase carried the absolute origin, so the probe's answer depended on where
+    the record's coordinates happen to start -- which for a PIC record is the
+    box origin, 1e6-1e8 natural units away.
+    """
+    traj, _, dirs, omegas = varying_circle
+    params = Parameters(epsilon=10.0, kernel="trace")
+    shifted = Trajectory(time=traj.time + 5000.0,
+                         position=traj.position + np.array([300.0, 0.0, 0.0]),
+                         momentum=traj.momentum, energy=traj.energy)
+    for omega in omegas[:2]:
+        base = bkb.lag_profile(traj, params, float(omega), dirs, [1.0, 1.0, 1.0])
+        moved = bkb.lag_profile(shifted, params, float(omega), dirs,
+                                [1.0, 1.0, 1.0])
+        scale = max(abs(base["total"]), 1e-300)
+        assert abs(moved["total"] - base["total"]) < 1e-10 * scale
+        assert np.max(np.abs(moved["cumulative"] - base["cumulative"])) < 1e-9 * scale
 
 
 # --------------------------------------------------------------------------

@@ -29,9 +29,13 @@ The upper-triangle convention (``j >= i``, off-diagonal doubled) encodes
 binned with the actual trapezoid weights ``w_i w_j`` rather than by index
 difference, because the end weights are ``dt/2`` and never repeat.
 
-Limitation: only the fixed-incident-energy phase is implemented.  A trajectory
-carrying an ``energy`` history (the local-energy mode) raises, because its phase
-and kernel are vertex-dependent -- see ``integrator._accumulate_row_local``.
+Both phases are implemented.  A trajectory carrying an ``energy`` history uses
+the local-energy mode: the per-vertex kernel coefficients come from
+``integrator._local_vertex_arrays`` and the phase from the accumulated tables
+``phase.local_phase_tables`` -- the same pair of helpers the integrator's local
+backend uses, so the probe measures the kernel that is actually computed.  (The
+phase is the path integral ``omega \\int f (1-n.v) dt``; the endpoint form is
+not translation invariant when ``f`` varies -- see ``phase.local_phase_tables``.)
 """
 
 from __future__ import annotations
@@ -39,7 +43,9 @@ from __future__ import annotations
 import numpy as np
 
 from . import kernel as _kernel
-from .integrator import PREFACTOR, cone_directions, trapz_weights
+from . import phase as _phase
+from .integrator import (PREFACTOR, _local_vertex_arrays, _recoil_args,
+                         cone_directions, trapz_weights)
 from .types import Parameters, Trajectory
 
 __all__ = ["lag_profile", "truncation_curve", "probe_directions"]
@@ -85,13 +91,6 @@ def lag_profile(trajectory: Trajectory, params: Parameters, omega: float,
         ``cancellation``  ``sum|terms| / |total|``
         ``dE_domega``     angle-integrated ``dE/domega`` from the same sum
     """
-    if trajectory.energy is not None:
-        raise NotImplementedError(
-            "local-energy trajectories are not supported by the probe: their "
-            "phase and kernel are vertex-dependent (see "
-            "integrator._accumulate_row_local). The closed-orbit control and "
-            "the constant-gamma testbed both use the fixed-energy phase."
-        )
     if dirs is None and dom is None:
         dirs, dom = probe_directions()
     elif dirs is None or dom is None:
@@ -105,13 +104,27 @@ def lag_profile(trajectory: Trajectory, params: Parameters, omega: float,
     w = trapz_weights(time)
     nt = time.shape[0]
 
-    eps_p = float(params.epsilon_prime(omega))
-    fac = float(omega * params.recoil_factor(omega))
+    local = trajectory.energy is not None
     mass = params.mass
-    # honour the parameter, do not hardcode: on shell the two kernels coincide,
-    # off shell they differ by ~7% on a gamma=10 circle at epsilon=5
-    kern = (_kernel.dot_kernel if params.kernel == "dot"
-            else _kernel.trace_kernel)
+    if local:
+        # Same helpers as the integrator's local backend, so the probe bins the
+        # kernel and phase that are actually computed: per-vertex coefficients
+        # A, B and the accumulated phase tables T, R of f = eps/eps'.
+        phase_kind, _ = _recoil_args(params)
+        A, B, f = _local_vertex_arrays(params.kernel, [omega],
+                                       trajectory.energy, phase_kind, mass)
+        A, B = A[0], B[0]                                   # (Nt,)
+        T, R = _phase.local_phase_tables(time, position, f)  # (1, Nt), (1, Nt, 3)
+        T = T[0]
+        nR = R[0] @ dirs.T                                  # (Nt, N_dirs)
+    else:
+        eps_p = float(params.epsilon_prime(omega))
+        fac = float(omega * params.recoil_factor(omega))
+        # honour the parameter, do not hardcode: on shell the two kernels
+        # coincide, off shell they differ by ~7% on a gamma=10 circle at
+        # epsilon=5
+        kern = (_kernel.dot_kernel if params.kernel == "dot"
+                else _kernel.trace_kernel)
 
     if bin_width is None:
         bin_width = float(np.min(np.diff(time)))
@@ -124,15 +137,25 @@ def lag_profile(trajectory: Trajectory, params: Parameters, omega: float,
         idx = np.arange(start, min(start + chunk, nt))
         ti = time[idx][:, None]
         dt = time[None, :] - ti
-        dr = position[None, :, :] - position[idx][:, None, :]
         upper = np.arange(nt)[None, :] >= idx[:, None]
 
-        ang = np.zeros_like(dt)
-        for d in range(dirs.shape[0]):
-            ang += dom[d] * np.cos(fac * (dt - dr @ dirs[d]))
+        if local:
+            n_mat = ((A[idx][:, None] + A[None, :])
+                     + (B[idx][:, None] + B[None, :])
+                     * (beta[idx] @ beta.T - 1.0))
+            ang = np.zeros_like(dt)
+            for d in range(dirs.shape[0]):
+                dphi = omega * ((T[None, :] - T[idx][:, None])
+                                - (nR[None, :, d] - nR[idx][:, None, d]))
+                ang += dom[d] * np.cos(dphi)
+        else:
+            dr = position[None, :, :] - position[idx][:, None, :]
+            ang = np.zeros_like(dt)
+            for d in range(dirs.shape[0]):
+                ang += dom[d] * np.cos(fac * (dt - dr @ dirs[d]))
+            n_mat = kern(beta[idx][:, None, :], beta[None, :, :],
+                         params.epsilon, omega, mass=mass, epsilon_prime=eps_p)
 
-        n_mat = kern(beta[idx][:, None, :], beta[None, :, :],
-                     params.epsilon, omega, mass=mass, epsilon_prime=eps_p)
         contrib = np.where(upper, w[idx][:, None] * w[None, :] * n_mat * ang, 0.0)
         # off-diagonal pairs are counted twice by the Hermitian form
         contrib = np.where(upper & (dt > 0.0), 2.0 * contrib, contrib)
