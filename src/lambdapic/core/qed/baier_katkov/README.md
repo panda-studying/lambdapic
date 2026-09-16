@@ -30,7 +30,7 @@
 - 自然单位 $c = \hbar = 1$，电子质量 $m_e = 1$（Compton 单位，SI 映射见 [§4](#4-单位制)）；
 - 自旋平均、极化求和的顶点核；
 - 角积分谱 $dW/d\omega$（每粒子每单位光子能量的发射概率）；
-- 支持**固定入射能量** $\varepsilon$ 和**局域能量** $\varepsilon(t)$ 两种模式（后者为 2026-09-09 完成的 P-2 项，见 [§2.4](#24-局域能量推广-p-2)）。
+- 支持**固定入射能量** $\varepsilon$ 和**局域能量** $\varepsilon(t)$ 两种模式（后者为 2026-09-09 完成的 P-2 项，相位形式 2026-09-16 修正，见 [§2.4](#24-局域能量推广-p-2)）。
 
 **明确不含**（当前版本不做）：多粒子系综求和、MPI/GPU、FFT/NUFFT 加速、形成长度窗口截断、重要性采样、LCFA/BK 混合模型、自旋分辨。它是一个**参考实现**，用来钉死单位、相位、反冲、正性、经典极限等约定，再以它为基准优化和集成。
 
@@ -100,11 +100,18 @@ $$\frac{m^2(\varepsilon - \varepsilon')^2}{2\,\varepsilon^2\varepsilon'^2} = \fr
 
 ⚠️ **历史教训（BUG-6）**：trace 核曾抄写错系数（把 $( \varepsilon^2+\varepsilon'^2)/(4\varepsilon'^2)$ 写成 $( \varepsilon^2+\varepsilon'^2)/(4\varepsilon\varepsilon')$，差一个 $\varepsilon/\varepsilon'$ 因子），导致"trace 与 dot 相差 $O(\omega)$"的假象。已修复，两核现严格重合。
 
-### 2.4 局域能量推广（P-2，2026-09-09 完成）
+### 2.4 局域能量推广（P-2，2026-09-09 完成；相位 2026-09-16 修正为路径积分，见 `REVIEW_AND_ROADMAP.md` §8.5）
 
 固定 $\varepsilon$ 只适用于均匀/恒定能量轨道。PIC 轨迹中电子能量沿途变化（激光等离子体加速，变化可达 $O(1)$），必须在**每个顶点**使用局域能量 $\varepsilon(t_i)$。局域推广把相位和核都拆成逐顶点贡献：
 
-$$\Phi_{ij} = \omega\Big[f_j\,x_j - f_i\,x_i\Big], \qquad x = t - \mathbf n\cdot\mathbf r, \qquad f_i = \frac{\varepsilon_i}{\varepsilon'_i}$$
+$$\Phi_{ij} = \omega\Big[(T_j - T_i) - \mathbf n\cdot(\mathbf R_j - \mathbf R_i)\Big]$$
+
+其中 $f_i = \varepsilon_i/\varepsilon'_i$，$T_i$、$\mathbf R_i$ 是 $f$ 沿记录在顶点 $i$ 之前的**梯形累积**（`phase.local_phase_tables`）：
+
+$$T_i = \sum_{m<i}\frac{f_m + f_{m+1}}{2}\,(t_{m+1} - t_m), \qquad
+\mathbf R_i = \sum_{m<i}\frac{f_m + f_{m+1}}{2}\,(\mathbf r_{m+1} - \mathbf r_m)$$
+
+即 $\omega$ 乘以 $f\,(1-\mathbf n\cdot\mathbf v)$ 在两顶点之间的**路径积分**。**不用端点形式** $\omega[f_jx_j - f_ix_i]$（$x=t-\mathbf n\cdot\mathbf r$）：$f$ 变化时它不是平移不变的——$\bar x$ 是**绝对**光锥坐标，$x\to x+c$ 给相位加 $\omega c\,(f_j-f_i)$，于是谱取决于记录坐标原点落在哪里（实测：把记录平移 $(5000, 300)$，$\omega=0.2$ 处 $d_2E$ 变 140%）。累积形式平移不变，且在 $f$ 为常数时**精确**退化回 [§2.3](#23-核-dottracevelocity) 的固定能量相位。
 
 $$N_{ij} = (A_i + A_j) + (B_i + B_j)\,(\mathbf b_i\cdot\mathbf b_j - 1)$$
 
@@ -121,11 +128,7 @@ $$N_{ij} = (A_i + A_j) + (B_i + B_j)\,(\mathbf b_i\cdot\mathbf b_j - 1)$$
 
 **在壳一致性由调用方负责**：核假定 $\lvert\mathbf b_i\rvert^2 = 1 - m^2/\varepsilon_i^2$，即能量历史与动量历史必须满足 $\varepsilon_i = m\sqrt{1+\lvert\mathbf u_i\rvert^2}$。`Trajectory.local_energy()` 的默认回退值正是这个在壳值；显式传入的 `energy`（如 PIC 能量历史）与 `momentum` 的一致性不在模块内校验。
 
-相位用**差分稳定形式**求值（`phase.local_recoil_phase` / numba 内核）：
-
-$$\Phi_{ij} = \omega\Big[\bar f\,(x_j - x_i) + \Delta f\,\frac{x_j + x_i}{2}\Big], \qquad \bar f = \frac{f_i + f_j}{2},\quad \Delta f = f_j - f_i$$
-
-能量变化只进入小量 $\Delta f$ 项，超相对论小角相位 $\sim(\gamma^{-2} + \theta^2)$ 不会被大数相减吞掉（与固定能量路径同一原理，见 [§3.5](#35-数值稳定性与采样判据)）。
+相位**只从差构造**，与固定能量路径同一原理（见 [§3.5](#35-数值稳定性与采样判据)）：逐 $(\omega,\mathbf n)$ 预计算累积表 $T_i$、$\mathbf R_i$，逐对相位取 $\omega[(T_j-T_i) - \mathbf n\cdot(\mathbf R_j-\mathbf R_i)]$，不做绝对相位相减，因此超相对论小角相位 $\sim(\gamma^{-2} + \theta^2)$ 不会被大数相减吞掉（`phase.local_phase_tables` / numba 内核）。
 
 ### 2.5 厄米对称性与实谱
 
@@ -163,7 +166,7 @@ $$I = \sum_{i,j} w_i w_j\, N(t_i, t_j)\, e^{-i\Phi(t_i, t_j)}, \qquad w = \text{
 - `@njit(parallel=True, cache=True)`，`prange` 并行。
 - **只算上三角**：$j \ge i$，非对角 $(i,j)$ 对贡献乘 2（厄米对称性，[§2.5](#25-厄米对称性与实谱)）。
 - **折行负载均衡**：行 $i$ 与行 $N_t-1-i$ 配对进同一任务（两行合计恰好 $N_t - 1$ 个非对角对），每个并行任务工作量相同。
-- **批量计算**：一次遍历把所有 $(\omega_k, \mathbf n_d)$ 对同时累加（`_double_sum_batch`）——固定能量模式下相位参数 `fac[k]`、核系数 `a[k], b[k]` 按频率预排；局域模式下逐顶点数组 `A, B, f` 形状 $(N_\omega, N_t)$，相位为 $\omega_k[\bar f\psi_d + \Delta f\,\chi_d]$，其中 $\psi_d = \Delta t - (\mathbf n_d\cdot\mathbf r_j - \mathbf n_d\cdot\mathbf r_i)$（差分形式）、$\chi_d = \bar t - (\mathbf n_d\cdot\mathbf r_j + \mathbf n_d\cdot\mathbf r_i)/2$（能量变化项，反冲因子恒定即 $\Delta f = 0$ 时该项消失）。
+- **批量计算**：一次遍历把所有 $(\omega_k, \mathbf n_d)$ 对同时累加（`_double_sum_batch`）——固定能量模式下相位参数 `fac[k]`、核系数 `a[k], b[k]` 按频率预排；局域模式下逐顶点核系数 `A, B` 与累积相位表 `T, R` 形状 $(N_\omega, N_t)$、$(N_\omega, N_t, 3)$，相位取表差 $\omega_k[(T_j - T_i) - \mathbf n_d\cdot(\mathbf R_j - \mathbf R_i)]$（路径积分，见 [§2.4](#24-局域能量推广-p-2)）。
 - `block` 参数控制每个并行任务的行数，默认 `max(1, min(32, ⌈Nt/2⌉/(4·线程数)))`。
 - 与 numpy 后端逐位一致到舍入误差（回归测试断言 $< 10^{-12}$）。
 
@@ -185,7 +188,7 @@ $$I = \sum_{i,j} w_i w_j\, N(t_i, t_j)\, e^{-i\Phi(t_i, t_j)}, \qquad w = \text{
 
 ### 3.5 数值稳定性与采样判据
 
-- **相位差分构造**：所有相位都从差 $t_2 - t_1$、$\mathbf n\cdot(\mathbf r_2 - \mathbf r_1)$ 构造，而不是两个独立的大数相位相减——超相对论小角相位 $\sim(\gamma^{-2} + \theta^2)$ 因此不被消去误差吞掉（`phase.py` 与 numba 内核均如此）。局域能量模式下见 [§2.4](#24-局域能量推广-p-2) 的 $\bar f/\Delta f$ 分解。
+- **相位差分构造**：所有相位都从差 $t_2 - t_1$、$\mathbf n\cdot(\mathbf r_2 - \mathbf r_1)$ 构造，而不是两个独立的大数相位相减——超相对论小角相位 $\sim(\gamma^{-2} + \theta^2)$ 因此不被消去误差吞掉（`phase.py` 与 numba 内核均如此）。局域能量模式下见 [§2.4](#24-局域能量推广-p-2) 的累积相位表。
 - **采样判据（Nyquist，2026-09-11 修正）**：双积分中最快相位速率为 $f\max\lvert1-\mathbf n\cdot\mathbf v\rvert$（$f=\omega\varepsilon/\varepsilon'$，在速度与 $\mathbf n$ 反平行处取到），梯形求积每振荡至少需两个采样点，即 $\Delta t\,f\max\lvert1-\mathbf n\cdot\mathbf v\rvert < \pi$。一圈上就是 $N_t > 4m_{max}$——**是 V8 docstring 中 $N_t > 2m$ 的两倍**：后者只允许每振荡一个采样点，实测仍会混叠（$\delta=0.5$、$m\approx1990$：$N_t=2m=3980$ 比值 2.16，$N_t=4m=7960$ 比值 1.0007）。该判据已实现为运行时守卫 `integrator.sampling_margin`（见 [§3.7](#37-适用性守卫采样混叠记录长度与角度分辨)）。
 
 ### 3.6 复杂度与性能现状
@@ -328,7 +331,7 @@ validation.py  V1–V8  ──► validation_plot.py ──► validation_summar
 - `classical_phase(t1, t2, omega, n, r1, r2)`：经典双时间相位 $\omega[(t_2-t_1) - \mathbf n\cdot(\mathbf r_2-\mathbf r_1)]$。
 - `recoil_frequency(omega, epsilon, epsilon_prime=None)`：有效反冲频率 $\omega\varepsilon/\varepsilon'$（$\varepsilon'$ 默认 $\varepsilon-\omega$；守卫 $\varepsilon'>0$）。**不是**光子频率的改变，而是形成长度积分内部相位的重新标定。
 - `recoil_phase(t1, t2, omega, n, r1, r2, epsilon, epsilon_prime=None)`：固定能量 BK 双时间相位 $\Phi = (\varepsilon/\varepsilon')\,\omega[(t_2-t_1) - \mathbf n\cdot(\mathbf r_2-\mathbf r_1)]$。$1\leftrightarrow 2$ 反对称 → 双时间核厄米。
-- `local_recoil_phase(t1, t2, omega, n, r1, r2, epsilon1, epsilon2, epsilon_prime1=None, epsilon_prime2=None)`：局域能量相位（[§2.4](#24-局域能量推广-p-2)），差分稳定形式 $\Phi = \omega[\bar f(x_2-x_1) + \Delta f(x_1+x_2)/2]$；顶点标签连同能量交换下反对称 → 厄米性保留。
+- `local_recoil_phase(t1, t2, omega, n, r1, r2, epsilon1, epsilon2, epsilon_prime1=None, epsilon_prime2=None)`：局域能量相位的**两点形式** $\Phi = \omega[f_2x_2 - f_1x_1]$，只在两顶点反冲因子相同（$\varepsilon_1 = \varepsilon_2$）时有效；$\varepsilon_1\ne\varepsilon_2$ 时它不具平移不变性（$\bar x$ 是绝对坐标），故**直接报错**并要求改用 `local_phase_tables`（[§2.4](#24-局域能量推广-p-2)）。顶点标签连同能量交换下反对称 → 厄米性保留。
 - `phase_along(t, omega, n, r, t0=None, r0=None)`：单时刻（振幅）相位 $\omega[(t-t_0) - \mathbf n\cdot(\mathbf r-\mathbf r_0)]$，供经典 LW 振幅使用；`t0/r0` 用于把相位锚定在首个样本，避免大数相消。
 
 ### 6.4 `kernel.py` — 顶点/旋量核
@@ -363,7 +366,7 @@ validation.py  V1–V8  ──► validation_plot.py ──► validation_summar
 **numpy 求和核心**
 
 - `_double_sum_numpy(time, position, beta, n, factor, kernel, epsilon, omega, eps_p, mass, chunk)`：固定能量全方阵双重和（分块外积，复数）。
-- `_double_sum_numpy_local(time, position, beta, n, omega, A, B, f, chunk)`：局域能量全方阵双重和（单频率；`dot = beta @ beta.T`，相位差分稳定形式）。
+- `_double_sum_numpy_local(time, position, beta, n, omega, A, B, T, R, chunk)`：局域能量全方阵双重和（单频率；`dot = beta @ beta.T`，相位取累积表之差 $\omega[(T_j-T_i) - \mathbf n\cdot(\mathbf R_j-\mathbf R_i)]$）。
 
 **numba 求和核心**
 
