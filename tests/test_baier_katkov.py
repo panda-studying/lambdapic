@@ -671,6 +671,66 @@ def test_record_adequacy_is_not_applicable_to_a_straight_record():
             [1.0], [[1.0, 0.0, 0.0]])) == []
 
 
+def test_curvature_rate_ignores_a_stationary_prefix():
+    """A record that starts from rest keeps the curvature rate of its live part.
+
+    PIC records begin before the drive arrives, so most samples can be
+    motionless (65% of the production LWFA record, ``|u| ~ 1e-31``).  The
+    median ``|dv/dt|`` over the *whole* record is then set by that jitter
+    rather than by the motion that radiates: measured ``2e-31`` against the
+    true ``chi/gamma^2 = 5e-3``, which made ``tau_f`` ~1e19 too long and
+    ``record_adequacy`` collapse to 0 instead of ``O(10)`` -- firing
+    ``RecordLengthWarning`` on a record that is long enough.
+    """
+    gamma, chi = 10.0, 0.5
+    beta = np.sqrt(1.0 - 1.0 / gamma ** 2)
+    rho = gamma ** 2 * beta ** 2 / chi
+    Omega = beta / rho
+    T = 2.0 * np.pi / Omega
+
+    def rest_then_arc(dead_fraction, jitter, n_samples=800, seed=0):
+        """``n_samples`` points, the first ``dead_fraction`` of them at rest."""
+        rng = np.random.default_rng(seed)
+        n_dead = int(dead_fraction * n_samples)
+        n_live = n_samples - n_dead
+        t = np.concatenate([
+            np.linspace(0.0, dead_fraction * T, n_dead, endpoint=False),
+            np.linspace(dead_fraction * T, T, n_live),
+        ])
+        phi = Omega * (t[n_dead:] - t[n_dead])
+        live = np.column_stack([rho * np.cos(phi), rho * np.sin(phi),
+                                np.zeros_like(phi)])
+        u_live = gamma * beta * np.column_stack([-np.sin(phi), np.cos(phi),
+                                                 np.zeros_like(phi)])
+        dead = rng.normal(0.0, jitter, (n_dead, 3))
+        return Trajectory(time=t, position=np.concatenate([dead, live]),
+                          momentum=np.concatenate([dead, u_live]))
+
+    # no dead part: every interval is active, so the plain median is unchanged
+    arc = rest_then_arc(0.0, 0.0)
+    dv = np.linalg.norm(np.diff(arc.beta(), axis=0), axis=1) / np.diff(arc.time)
+    assert bki._curvature_rate(arc.time, arc.beta()) == float(np.median(dv))
+
+    # any dead fraction above one half used to drag the median into the jitter;
+    # the answer must be the live motion's chi/gamma^2 either way
+    for dead_fraction in (0.5, 0.65, 0.8):
+        for jitter in (1e-31, 1e-18):
+            traj = rest_then_arc(dead_fraction, jitter)
+            rate = bki._curvature_rate(traj.time, traj.beta())
+            assert 0.99 * chi / gamma ** 2 < rate < 1.01 * chi / gamma ** 2
+
+    # the diagnostics riding on it must not report the dead segment
+    traj = rest_then_arc(0.65, 1e-31)
+    adequacy = bki.record_adequacy(traj.time, traj.beta(), [1.0, 4.0], gamma)
+    assert np.all(np.isfinite(adequacy))
+    assert np.all(adequacy > 1.5)          # long enough -- must not be flagged
+
+    # a record that never moves has no curvature: 0, not nan, not the jitter
+    still = Trajectory(time=np.linspace(0.0, 1.0, 16),
+                       position=np.zeros((16, 3)), momentum=np.zeros((16, 3)))
+    assert bki._curvature_rate(still.time, still.beta()) == 0.0
+
+
 def test_spectrum_metadata_carries_adequacy_diagnostics():
     """``compute_spectrum`` reports the per-omega margins alongside the spectrum."""
     gamma = 10.0

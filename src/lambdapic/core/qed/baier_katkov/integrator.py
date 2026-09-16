@@ -916,18 +916,42 @@ def _max_phase_rate(beta, dirs):
 
 
 def _curvature_rate(time, beta):
-    """Median ``|dv/dt|`` over the record (the velocity-rotation rate).
+    """Median ``|dv/dt|`` over the *active* part of the record (velocity-rotation rate).
 
     Equals ``chi/gamma^2`` for uniform circular motion.  ``0`` for a straight
     record, for which the formation-time diagnostic does not apply (there the
     kernel's vacuum subtraction already removes the straight-line part).
+
+    A PIC record fed in from rest -- the drive has not reached the particle yet
+    -- is *mostly motionless*, and a plain median over the whole record is then
+    dominated by the numerical jitter of those samples rather than by the
+    motion that radiates.  Measured on a ``gamma = 10``, ``chi = 0.5`` circle
+    preceded by 65% of samples at rest (``|u| ~ 1e-31``): the median collapses
+    to ``2e-31`` against the true ``chi/gamma^2 = 5e-3``, so ``tau_f`` (which
+    goes as ``rate**(-2/3)``) comes out ~1e19 too long and ``L/tau_f``
+    collapses to ~0 -- measured ``1e-18`` on the production LWFA record, whose
+    dead fraction is the same 65%, instead of the ``O(10)``-``O(100)`` its
+    length actually supports.  That is how ``RecordLengthWarning`` came to
+    fire on records that are long enough.
+
+    Samples slower than ``1e-3`` of the record's peak speed are therefore
+    dropped, together with any interval touching one of them, so that the
+    rest-to-moving transient does not count either -- the rate must come from
+    intervals whose *both* ends move.  The threshold is relative, so the
+    diagnostic stays scale invariant; on a record with no dead segment every
+    sample is active and the result is bit-for-bit unchanged.
     """
     time = np.asarray(time, dtype=np.float64)
     beta = np.asarray(beta, dtype=np.float64)
     if time.shape[0] < 3:
         return 0.0
+    speed = np.linalg.norm(beta, axis=1)
+    active = speed > 1e-3 * float(speed.max())
+    moving = active[:-1] & active[1:]
+    if not np.any(moving):
+        return 0.0
     dv = np.linalg.norm(np.diff(beta, axis=0), axis=1) / np.diff(time)
-    return float(np.median(dv))
+    return float(np.median(dv[moving]))
 
 
 def velocity_swing(beta):
@@ -1080,8 +1104,9 @@ def formation_time(time, beta, omega, epsilon, epsilon_prime=None):
 
     ``tau_f = (6 eps' / (omega Omega_eff^2))**(1/3)`` -- the time for the
     curvature term of the accumulated phase, ``(omega/2eps') Omega_eff^2
-    tau^3/3``, to reach unity (``Omega_eff`` = median ``|dv/dt|``, equal to
-    ``chi/gamma^2`` on a circle).  Returns ``inf`` for a straight record or for
+    tau^3/3``, to reach unity (``Omega_eff`` = median ``|dv/dt|`` over the
+    moving samples, equal to ``chi/gamma^2`` on a circle).  Returns ``inf`` for
+    a straight record or for
     ``omega <= 0`` (where ``tau_f -> inf``), cases in which the diagnostic does
     not apply -- :func:`record_adequacy` maps ``inf`` to "not applicable" rather
     than to "maximally inadequate".
