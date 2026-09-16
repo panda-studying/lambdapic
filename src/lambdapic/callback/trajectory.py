@@ -178,7 +178,15 @@ class TrajectoryRecorder(Callback):
         u = np.full((self._tracked.size, 3), np.nan)
         self._collect(sim, x, u, shift)
 
-        self._t.append(np.full(self._tracked.size, sim.time))
+        # ``t`` is written only where this rank actually holds the particle.  It
+        # used to be filled with ``sim.time`` unconditionally, which made the
+        # merge below a no-op: it looks for ranks whose ``t`` is NaN to fill in
+        # from, and a finite ``t`` everywhere meant every rank looked like an
+        # owner, so the rank that really had the sample was discarded (measured
+        # under mpirun -n 2 tracking one particle owned by each rank:
+        # n_samples = [6, 0], the second particle's x all NaN).
+        found = np.isfinite(x).all(axis=1)
+        self._t.append(np.where(found, sim.time, np.nan))
         self._x.append(x)
         self._u.append(u)
         self._itimes.append(int(sim.itime))
