@@ -115,6 +115,49 @@ def test_recorder_writes_a_usable_trajectory(tmp_path):
     assert np.all(traj.gamma() >= 1.0)
 
 
+def test_recorder_can_record_the_fields_at_the_particle(tmp_path):
+    """``fields=True`` adds E and B in SI; the BK integral itself needs neither.
+
+    The adiabatic (LCFA) reference is built from
+    ``chi(t) = gamma|E_perp + v x B| / E_cr``, so the comparison needs the field
+    on the *same* trajectory -- but the Baier--Katkov double integral needs only
+    ``(t, x, u)``, which is why this is opt-in (it costs twice the ``x``
+    payload).  A uniform ``B_z`` makes the recorded values checkable.
+    """
+    B0 = 10.0                                            # tesla
+    sim, ele = _sim(nx=32, ny=32)
+    for p in sim.patches:
+        p.fields.bz[:, :] = B0
+
+    rec = TrajectoryRecorder(ele, tmp_path / "fields.npz", interval=1,
+                             max_particles=2, fields=True)
+    sim.run(nsteps=5, callbacks=[rec])
+    with np.load(rec.write()) as d:
+        assert {"e", "b"} <= set(d.files)
+        assert d["e"].shape == (2, 5, 3) and d["b"].shape == (2, 5, 3)
+        n = int(d["n_samples"][0])
+        assert np.all(d["n_samples"] == n)               # no rank gaps
+        # sample 0 is taken before the pusher has interpolated anything, so the
+        # fields are reported as unavailable rather than as a zero field
+        assert np.all(np.isnan(d["e"][:, 0, :]))
+        assert np.all(np.isnan(d["b"][:, 0, :]))
+        for i in range(2):
+            assert np.all(np.isfinite(d["e"][i][1:n]))
+            assert np.all(np.isfinite(d["b"][i][1:n]))
+        # a uniform field interpolates exactly, whatever the particle's position
+        assert np.allclose(d["b"][:, 1:n, 2], B0, rtol=1e-12)
+        assert np.allclose(d["b"][:, 1:n, :2], 0.0, atol=1e-12)
+        assert np.allclose(d["e"][:, 1:n, :], 0.0, atol=1e-9)
+
+    # the default record is unchanged: no field arrays, everything else the same
+    rec2 = TrajectoryRecorder(ele, tmp_path / "plain.npz", interval=1,
+                              max_particles=2)
+    sim.run(nsteps=5, callbacks=[rec2])
+    with np.load(rec2.write()) as d:
+        assert not ({"e", "b"} & set(d.files))
+        assert set(d.files) >= {"id", "n_samples", "t", "x", "u", "w", "samples"}
+
+
 def test_recorder_tracks_the_same_ids_as_the_run_proceeds(tmp_path):
     """Ids are stable and the record has no gaps, even across patch migration."""
     sim, ele = _sim()

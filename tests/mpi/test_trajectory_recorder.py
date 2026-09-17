@@ -25,7 +25,8 @@ OUT = "/tmp/bk_recorder_mpi_test.npz"
 
 
 @pytest.mark.mpi
-def test_recorder_merges_histories_across_ranks():
+@pytest.mark.parametrize("fields", [False, True])
+def test_recorder_merges_histories_across_ranks(fields):
     """A particle owned by a non-root rank must survive the merge.
 
     Before the fix the merge keyed on ``t`` being NaN, but ``t`` was written
@@ -51,6 +52,9 @@ def test_recorder_merges_histories_across_ranks():
     ele = Electron(density=disc, ppc=1)
     sim.add_species([ele])
     sim.initialize()
+    B0 = 10.0                                    # uniform, so the record is checkable
+    for p in sim.patches:
+        p.fields.bz[:, :] = B0
 
     ispec = ele.ispec
     local = np.concatenate([p.particles[ispec].id[p.particles[ispec].is_alive]
@@ -61,7 +65,7 @@ def test_recorder_merges_histories_across_ranks():
     # one particle per rank, chosen identically on every rank
     want = np.array([allids[owner == r][0] for r in range(size)], dtype=np.uint64)
 
-    rec = TrajectoryRecorder(ele, OUT, interval=1, ids=want)
+    rec = TrajectoryRecorder(ele, OUT, interval=1, ids=want, fields=fields)
     sim.run(nsteps=6, callbacks=[rec])
     rec.write()
 
@@ -70,3 +74,12 @@ def test_recorder_merges_histories_across_ranks():
             assert d["n_samples"].tolist() == [6] * size, d["n_samples"]
             assert np.all(np.isfinite(d["x"])), "merged history has NaN"
             assert np.all(np.diff(d["t"], axis=1)[:, :5] > 0.0)
+            if fields:
+                # the field channel merges with the same ownership mask as x
+                assert {"e", "b"} <= set(d.files)
+                assert np.all(d["n_samples"] == 6)
+                assert np.all(np.isfinite(d["b"][:, 1:, :]))
+                assert np.allclose(d["b"][:, 1:, 2], B0, rtol=1e-12)
+                assert np.allclose(d["e"][:, 1:, :], 0.0, atol=1e-9)
+            else:
+                assert not ({"e", "b"} & set(d.files))

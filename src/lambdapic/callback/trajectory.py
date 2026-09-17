@@ -45,6 +45,27 @@ itself, so it would be double counted.  The guard below checks the species'
 ``radiation`` flag and the collision operator, and can only be bypassed
 explicitly.
 
+**The fields at the particle (``fields=True``).**  The Baier--Katkov spectrum
+itself needs only ``(t, x, u)``, but the *adiabatic* (LCFA) reference it is
+meant to be compared with needs ``chi(t)``, and chi needs the fields:
+``chi = gamma|E_perp + v x B| / E_cr``.  With ``fields=True`` the recorder also
+writes the ``E`` and ``B`` the particle saw, in **SI** (V/m, T), so the
+comparison can be built on the same trajectory.  Two things to know:
+
+* These are the co-located values the pusher already interpolated into
+  ``ex_part`` etc. (the same arrays the PIC's own LCFA pipeline reads), not a
+  fresh interpolation at the recorded position.  They sit at the half-step
+  position ``x - u*dt/2``, which is where a Yee leapfrog defines the fields --
+  a half-step offset, not an error, but it is one half-step.
+* A sample taken at ``itime == 0`` carries **NaN**: the pusher has not
+  interpolated yet, so there is nothing to report.  ``t``/``x``/``u`` of that
+  sample are fine, and ``n_samples`` is unaffected (the gap check looks at
+  ``t`` and ``x``); a consumer of the fields drops sample 0.
+* Reading them costs nothing per step; *storing* them costs twice the ``x``
+  payload (three components each for ``E`` and ``B``).  Off by default, because
+  a record without them is still valid input for everything except the LCFA
+  comparison.
+
 Known limitation: :class:`~lambdapic.callback.utils.MovingWindow` deletes the
 particles it sweeps past, so a moving-window run has no full-length history for
 a particle it has overtaken -- and a particle identified as interesting at the
@@ -75,7 +96,10 @@ __all__ = ["TrajectoryRecorder"]
 
 
 class TrajectoryRecorder(Callback):
-    """Follow selected particles and write their ``(t, x, u)`` history to ``.npz``.
+    """Follow selected particles and write their history to ``.npz``.
+
+    Writes ``t``, ``x``, ``u`` always, and ``e``/``b`` (the fields at the
+    particle) when ``fields=True``.
 
     Parameters
     ----------
@@ -101,6 +125,12 @@ class TrajectoryRecorder(Callback):
     allow_recoil:
         Bypass the non-radiating guard.  The resulting record is *not* valid
         input for the Baier--Katkov module; only for diagnostics.
+    fields:
+        Also record the ``E`` and ``B`` fields at the particle (SI: V/m, T), as
+        the ``e`` and ``b`` arrays of the output.  Needed to build the
+        adiabatic (LCFA) reference on the same trajectory -- see the module
+        docstring for the half-step caveat and the storage cost.  Off by
+        default: the Baier--Katkov integral itself needs only ``(t, x, u)``.
     """
 
     DEFAULT_STAGE: str = "start"
@@ -114,6 +144,7 @@ class TrajectoryRecorder(Callback):
         ids: Optional[Sequence[int]] = None,
         select_after: int = 0,
         allow_recoil: bool = False,
+        fields: bool = False,
     ) -> None:
         if not isinstance(interval, int) or isinstance(interval, bool):
             raise TypeError(
@@ -140,11 +171,14 @@ class TrajectoryRecorder(Callback):
         self._explicit_ids = None if ids is None else np.asarray(ids, dtype=np.uint64)
         self.select_after = int(select_after)
         self.allow_recoil = allow_recoil
+        self.fields = bool(fields)
 
         self._tracked: Optional[np.ndarray] = None      # uint64, identical on all ranks
         self._t: list[np.ndarray] = []                  # (K,) SI seconds per sample
         self._x: list[np.ndarray] = []                  # (K, 3) SI metres
         self._u: list[np.ndarray] = []                  # (K, 3) dimensionless
+        self._e: list[np.ndarray] = []                  # (K, 3) V/m, fields=True only
+        self._b: list[np.ndarray] = []                  # (K, 3) tesla
         self._itimes: list[int] = []                    # sim.itime of each sample
         self._w: Optional[np.ndarray] = None            # (K,)
         self._sim = None                               # last Simulation seen
@@ -174,7 +208,9 @@ class TrajectoryRecorder(Callback):
 
         x = np.full((self._tracked.size, 3), np.nan)
         u = np.full((self._tracked.size, 3), np.nan)
-        self._collect(sim, x, u)
+        e = np.full((self._tracked.size, 3), np.nan) if self.fields else None
+        b = np.full((self._tracked.size, 3), np.nan) if self.fields else None
+        self._collect(sim, x, u, e, b)
 
         # ``t`` is written only where this rank actually holds the particle.  It
         # used to be filled with ``sim.time`` unconditionally, which made the
@@ -187,6 +223,18 @@ class TrajectoryRecorder(Callback):
         self._t.append(np.where(found, sim.time, np.nan))
         self._x.append(x)
         self._u.append(u)
+        if self.fields:
+            if int(sim.itime) == 0:
+                # at itime = 0 the pusher has not interpolated the fields yet,
+                # so ``ex_part`` still holds its initialisation.  Report NaN --
+                # "not available" -- rather than a zero field that was never
+                # measured.  From the second recorded sample on, the arrays hold
+                # the previous step's interpolation (one half-step behind the
+                # recorded position; see the module docstring).
+                e[:] = np.nan
+                b[:] = np.nan
+            self._e.append(e)
+            self._b.append(b)
         self._itimes.append(int(sim.itime))
 
     # -- helpers -----------------------------------------------------------
@@ -258,8 +306,8 @@ class TrajectoryRecorder(Callback):
             w = np.nanmax(np.vstack(gathered), axis=0)
         return w
 
-    def _collect(self, sim, x: np.ndarray, u: np.ndarray) -> None:
-        """Fill ``x``/``u`` rows for the tracked ids found on this rank.
+    def _collect(self, sim, x: np.ndarray, u: np.ndarray, e=None, b=None) -> None:
+        """Fill ``x``/``u`` (and optionally ``e``/``b``) for the tracked ids.
 
         Coordinates are taken as they are: the PIC stores them in the laboratory
         frame, and no field configuration shifts them (see the module docstring
@@ -279,6 +327,11 @@ class TrajectoryRecorder(Callback):
                 j = idx[hit[0]]
                 x[k] = (part.x[j], part.y[j], part.z[j])
                 u[k] = (part.ux[j], part.uy[j], part.uz[j])
+                if e is not None:
+                    # the co-located fields the pusher interpolated this step
+                    # (the same arrays the PIC's LCFA pipeline reads)
+                    e[k] = (part.ex_part[j], part.ey_part[j], part.ez_part[j])
+                    b[k] = (part.bx_part[j], part.by_part[j], part.bz_part[j])
 
     # -- output ------------------------------------------------------------
     def write(self, sim=None) -> Optional[str]:
@@ -294,42 +347,42 @@ class TrajectoryRecorder(Callback):
             return None
 
         t = np.stack(self._t).T                                   # (K, Nt)
-        x = np.transpose(np.stack(self._x), (1, 0, 2))            # (K, Nt, 3)
-        u = np.transpose(np.stack(self._u), (1, 0, 2))
+        names = ["x", "u"] + (["e", "b"] if self.fields else [])
+        sources = [self._x, self._u] + ([self._e, self._b] if self.fields else [])
+        vectors = [np.transpose(np.stack(v), (1, 0, 2)) for v in sources]  # (K, Nt, 3)
 
         if sim is not None and sim.mpi.comm.Get_size() > 1:
-            t, x, u = self._merge(sim, t, x, u)
+            t, vectors = self._merge(sim, t, vectors)
         if sim is not None and sim.mpi.rank != 0:
             return None
 
-        n_samples = self._valid_prefix(t, x)
+        n_samples = self._valid_prefix(t, vectors[0])
         w = np.full(self._tracked.size, np.nan) if self._w is None else self._w
-        np.savez(
-            self.path,
-            id=self._tracked,
-            n_samples=n_samples,
-            t=t,
-            x=x,
-            u=u,
-            w=w,
-            samples=np.asarray(self._itimes, dtype=np.int64),
-        )
+        arrays = dict(id=self._tracked, n_samples=n_samples, t=t, w=w,
+                      samples=np.asarray(self._itimes, dtype=np.int64))
+        arrays.update(zip(names, vectors))
+        np.savez(self.path, **arrays)
         return str(self.path)
 
-    def _merge(self, sim, t, x, u):
-        """Combine per-rank histories: exactly one rank holds each sample."""
+    def _merge(self, sim, t, vectors):
+        """Combine per-rank histories: exactly one rank holds each sample.
+
+        ``t`` is NaN where this rank does not hold the particle (see
+        :meth:`_call`), so it is both the ownership marker and the mask applied
+        to every per-vector array; the vectors are ``(K, Nt, 3)`` and share it.
+        """
         comm = sim.mpi.comm
-        gathered = comm.gather((t, x, u), root=0)
+        gathered = comm.gather((t, *vectors), root=0)
         if sim.mpi.rank != 0:
-            return t, x, u
-        out_t, out_x, out_u = gathered[0]
-        for rt, rx, ru in gathered[1:]:
-            fill = ~np.isfinite(out_t) & np.isfinite(rt)
-            out_t = np.where(fill, rt, out_t)
+            return t, vectors
+        out = list(gathered[0])
+        for row in gathered[1:]:
+            fill = ~np.isfinite(out[0]) & np.isfinite(row[0])
+            out[0] = np.where(fill, row[0], out[0])
             fill3 = fill[:, :, None]
-            out_x = np.where(fill3, rx, out_x)
-            out_u = np.where(fill3, ru, out_u)
-        return out_t, out_x, out_u
+            for j in range(1, len(out)):
+                out[j] = np.where(fill3, row[j], out[j])
+        return out[0], out[1:]
 
     @staticmethod
     def _valid_prefix(t: np.ndarray, x: np.ndarray) -> np.ndarray:
