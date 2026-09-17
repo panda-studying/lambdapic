@@ -1,11 +1,20 @@
-"""Testbed: record a *real* PIC trajectory for the Baier--Katkov module.
+"""Testbed: record a *real* PIC trajectory and validate Baier--Katkov on it.
 
-The banded-truncation verdict in ``REVIEW_AND_ROADMAP.md`` §3.5 is decisive only
-on a closed orbit; the aperiodic case -- which is what a PIC actually produces --
-could not be settled because the synthetic record used there was barely four
-turns long.  This script builds a cheap but adequate testbed: **one electron
-gyrating in a static magnetic field**, recorded through the real pipeline
-(Boris pusher, field interpolation, SI units) over many gyro-periods.
+Two jobs, in the order they matter:
+
+1. **End-to-end validation against a known answer** (2026-09-16).  Every
+   ingredient of the PIC -> spectrum chain is validated on its own -- V1--V8 on
+   analytic trajectories, the recorder on synthetic records -- but the *seam*
+   (Yee fields -> Boris push -> recorder -> SI adapter -> double-time integral)
+   had never been compared with an analytic spectrum.  A uniform field makes it
+   possible: the field along the orbit is exactly constant, so
+   ``reference.quantum_synchrotron_rate`` **is** the analytic evaluation of the
+   integral the module computes (the same argument as V8, which does it on an
+   analytic circle rather than on a PIC record).  ``--compare`` turns it on.
+2. **An adequate record for the truncation question**.  The banded-truncation
+   verdict is decisive only on a closed orbit; the aperiodic case is what a PIC
+   actually produces.  This orbit is periodic, but it is a *real* PIC record:
+   Boris pusher, field interpolation, SI units, the recorder, the adapter.
 
 Why a magnetic field and not a laser: the module's sampling criterion is
 ``dt * (omega * eps/eps') * max_n|1 - n.v| < pi``, and the ``max`` is taken over
@@ -15,7 +24,8 @@ peak needs 10^2-10^3 steps per laser period, while a CFL-limited ``dx =
 lambda/32`` grid delivers only 48.  The gyro-orbit is under-resolved by a much
 smaller factor -- but note it is *not* resolved at ``omega_c``: with the
 defaults the margin is 3.17 there, so only ``omega <~ 0.6 omega_c`` is usable
-(the driver prints the margin; trust it, not this paragraph).
+(the driver prints the margin; trust it, not this paragraph).  The comparison
+therefore uses ``delta <= 0.3``.
 
 **There is no field-gradient option, deliberately.**  A static, spatially
 varying ``B`` is not a source-free Maxwell solution: ``B = B_z(y) z-hat`` is
@@ -31,6 +41,7 @@ supporting current).
 Usage::
 
     python example/bk-testbed.py --periods 10 --out /tmp/bk_g0.npz
+    python example/bk-testbed.py --periods 4 --compare          # + spectrum check
 """
 
 from __future__ import annotations
@@ -184,19 +195,142 @@ def _place_electron(sim, ele, x0: float, y0: float, gamma: float, beta: float) -
         part.inv_gamma[idx[0]] = 1.0 / gamma
 
 
+def _orbit_omega(traj):
+    """Measured rotation rate of the recorded orbit, and the fit residual.
+
+    The gyro-phase ``atan2(beta_y, beta_x)`` is linear in time for uniform
+    circular motion.  The rate is **measured** rather than taken from
+    ``chi/(gamma^2 beta)`` because the Boris rotation advances by
+    ``2 atan(Omega dt/2)`` per step: the discrete orbit has a slightly longer
+    period and a slightly larger radius than the continuous one, and the
+    reference spectrum must be evaluated for the orbit the particle actually
+    has.  Reporting the difference separately keeps the pusher's discretization
+    error apart from the module's.
+
+    The residual is a one-number noise diagnostic: it is the angular jitter the
+    record carries on top of uniform rotation (field interpolation, round-off,
+    the half-step staggering of the pusher).
+    """
+    beta = traj.beta()
+    theta = np.unwrap(np.arctan2(beta[:, 1], beta[:, 0]))
+    A = np.column_stack([traj.time, np.ones_like(traj.time)])
+    fit = np.linalg.lstsq(A, theta, rcond=None)[0]
+    return float(fit[0]), float(np.max(np.abs(theta - A @ fit)))
+
+
+def compare_spectrum(path, meta, turns=(1, 2)) -> None:
+    """BK on the recorded PIC orbit vs the exact synchrotron spectrum.
+
+    The end-to-end check: the same comparison V8 makes on an *analytic* circle,
+    but here the trajectory comes out of the real pipeline (Yee fields, Boris
+    pusher, field interpolation, SI units, recorder, SI adapter).  For uniform
+    circular motion the field along the trajectory is exactly constant, so
+    ``reference.quantum_synchrotron_rate`` is the analytic evaluation of the
+    integral the module computes, and one turn's angle-integrated
+    ``dE/domega`` at a recoil-shifted harmonic equals ``T dP/domega``.
+
+    Three things are reported: the ratio to the exact spectrum (the end-to-end
+    number), the measured-vs-continuous orbit (the pusher's error), and the
+    ratio between one and two turns at the same harmonics (the inter-turn
+    coherence law of section 3.4, now on a PIC record: it must be 4).
+    """
+    from lambdapic.core.qed.baier_katkov import reference as R
+    from lambdapic.core.qed.baier_katkov.integrator import (BKIntegrator,
+                                                            sampling_margin)
+    from lambdapic.core.qed.baier_katkov.trajectory import as_trajectory_si
+    from lambdapic.core.qed.baier_katkov.types import Parameters, Trajectory
+    from lambdapic.core.qed.baier_katkov.validation import harmonics_for_deltas
+
+    d = np.load(path)
+    n = int(np.atleast_1d(d["n_samples"])[0])
+    t_si, x_si, u = d["t"][0][:n], d["x"][0][:n], d["u"][0][:n]
+
+    # The PIC stores u, and the adapter derives eps(t) = sqrt(1 + |u|^2) from
+    # it when energy is not given -- exactly the on-shell energy the kernel
+    # assumes.  Nothing has to be passed, and nothing can be silently wrong.
+    traj = as_trajectory_si(t_si, x_si, u=u)
+    assert traj.energy is not None          # derived, not the fixed-eps fallback
+
+    Omega, resid = _orbit_omega(traj)
+    gamma = float(traj.energy.mean())
+    beta = np.sqrt(1.0 - 1.0 / gamma ** 2)
+    chi = gamma ** 2 * beta * Omega                  # = gamma*beta*B/B_cr
+    rho = beta / Omega
+    T = 2.0 * np.pi / Omega
+    print(f"\nmeasured orbit: Omega={Omega:.6f} "
+          f"(continuous {meta['omega_c']:.6f}, ratio {Omega / meta['omega_c']:.6f})  "
+          f"rho={rho:.3f} (continuous {meta['rho']:.3f})  chi={chi:.4f}")
+    print(f"phase-fit residual: {resid:.2e} rad over "
+          f"{traj.time[-1] - traj.time[0]:.1f} natural units")
+
+    per_turn = int(round(T / float(np.median(np.diff(traj.time)))))
+    deltas = np.array([0.05, 0.1, 0.2, 0.3])
+    m = harmonics_for_deltas(deltas, Omega, gamma)
+    omega = R.recoil_shifted_harmonic(m, Omega, gamma)
+    delta = omega / gamma
+    exact = T * delta * R.quantum_synchrotron_rate(delta, chi, gamma)
+
+    def one_turn(k_turns):
+        k = int(round(k_turns * per_turn))
+        if k + 1 > traj.n_samples:
+            raise SystemExit(f"record holds {traj.n_samples} samples, "
+                             f"need {k + 1} for {k_turns} turns")
+        sl = slice(0, k + 1)
+        return Trajectory(time=traj.time[sl], position=traj.position[sl],
+                          momentum=traj.momentum[sl], energy=traj.energy[sl])
+
+    dirs, wts = R.orbit_direction_grid(gamma)
+    margin = np.array([float(sampling_margin(
+        one_turn(1).time, one_turn(1).beta(), dirs, np.array([w]),
+        np.array([w * gamma / (gamma - w)]))[0]) for w in omega])
+
+    print(f"\n{NX}x{NY} cells, {per_turn} steps/turn, comparing at the "
+          f"recoil-shifted harmonics")
+    print(f"{'kernel':>6} {'delta':>6} {'m':>5} {'margin':>7} {'BK dE/dw':>12} "
+          f"{'exact':>12} {'ratio':>8}")
+    spectra = {}
+    for kernel in ("dot", "trace"):
+        spec = one_turn(1)
+        bk = BKIntegrator(spec, Parameters(epsilon=gamma, kernel=kernel),
+                          checks="ignore")
+        dE = bk.d2_energy_batch(omega, dirs) @ wts
+        spectra[kernel] = dE
+        for i in range(delta.size):
+            print(f"{kernel:>6} {delta[i]:6.3f} {m[i]:5d} {margin[i]:7.3f} "
+                  f"{dE[i]:12.5e} {exact[i]:12.5e} {dE[i] / exact[i]:8.4f}")
+
+    # fixed-epsilon cross-check: |u| is constant here, so it must agree
+    fixed = Trajectory(time=one_turn(1).time, position=one_turn(1).position,
+                       momentum=one_turn(1).momentum)
+    dE_fixed = BKIntegrator(fixed, Parameters(epsilon=gamma, kernel="dot"),
+                            checks="ignore").d2_energy_batch(omega, dirs) @ wts
+    print(f"local vs fixed-epsilon (same record): "
+          f"{np.array2string(dE_fixed / spectra['dot'], precision=6)}")
+
+    # inter-turn coherence on a PIC record: line-centre density ~ n^2
+    if len(turns) > 1:
+        n_turns = int(max(turns))
+        wide = one_turn(n_turns)
+        dE_n = BKIntegrator(wide, Parameters(epsilon=gamma, kernel="dot"),
+                            checks="ignore").d2_energy_batch(omega, dirs) @ wts
+        print(f"{n_turns} turns / 1 turn at the same harmonics (expect "
+              f"{n_turns ** 2}): {np.array2string(dE_n / spectra['dot'], precision=3)}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--periods", type=float, default=10.0,
                     help="gyro-periods to record (10 gives L/tau_f ~ 125)")
     ap.add_argument("--out", type=Path, default=Path("/tmp/bk_testbed.npz"))
+    ap.add_argument("--compare", action="store_true",
+                    help="also run the end-to-end spectrum comparison")
     args = ap.parse_args()
 
     sim, ele, nsteps, meta = build_simulation(args.periods)
 
     rec = TrajectoryRecorder(ele, args.out, interval=1, max_particles=1)
     sim.run(nsteps=nsteps, callbacks=[rec])
-    path = rec.write()
-    print(f"recorded -> {path}")
+    print(f"recorded -> {rec.write()}")
 
     # load what was actually written: np.savez would have appended ".npz" to a
     # suffix-less --out, so args.out is not necessarily the file
@@ -211,6 +345,9 @@ def main() -> None:
     print(f"|u|: {p.min():.6f} .. {p.max():.6f}  "
           f"(fluctuation {(p.max() - p.min()) / p.mean():.2e}, expect round-off level)")
     print(f"t strictly increasing: {bool(np.all(np.diff(d['t'][0][:n]) > 0))}")
+
+    if args.compare:
+        compare_spectrum(rec.path, meta)
 
 
 if __name__ == "__main__":
