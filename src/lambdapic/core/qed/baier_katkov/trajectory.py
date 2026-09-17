@@ -45,6 +45,12 @@ def as_trajectory(time, position, momentum=None, energy=None) -> Trajectory:
     Ordering, positivity and finiteness are checked by
     :meth:`Trajectory.__post_init__`; mass and charge live on
     :class:`~.types.Parameters`, which alone governs the spectrum.
+
+    ``energy=None`` means the **fixed-incident-energy** phase: the right choice
+    for a record whose ``|momentum|`` is constant, and silently wrong for one
+    that is not.  This constructor does not second-guess the caller -- for a
+    PIC record use :func:`as_trajectory_si`, which derives the energy history
+    from the momentum when it is not given.
     """
     return Trajectory(time=time, position=position, momentum=momentum,
                       energy=energy)
@@ -67,19 +73,22 @@ def as_trajectory_si(t_si, x_si, u=None, energy=None, n_samples=None) -> Traject
         entry (which takes kg m/s) is deliberately **not** used here.
     energy : (Nt,) array, optional
         Local electron energy ``eps(t_i)`` in **natural units** (for an
-        electron that is just ``gamma = 1/inv_gamma``).  Pass it whenever the
-        record's ``|u|`` is not constant: the integrator switches to the
-        local-energy phase **only** when ``Trajectory.energy`` is set, and
-        ``Trajectory.local_energy()`` — the on-shell ``gamma`` fallback — is
-        never consulted by the integrator.  Omitting it therefore evaluates an
-        accelerating record at a *fixed* incident energy, silently.  Measured
-        on the production LWFA record (``gamma`` 1.0 -> 2.4, interaction window
-        only), where the fixed fallback is additionally *off shell*: with the
-        ``dot`` kernel the two agree to 0.06% inside the resolvable band (its
-        coefficients are ``eps``-insensitive when ``omega/eps ~ 1e-5``), but
-        with the ``trace`` kernel they differ by factors of 0.46-17 — and the
-        fixed evaluation's own two kernels disagree there, which is the tell
-        that the local form is the only well-defined one on such a record.
+        electron that is just ``gamma = 1/inv_gamma``).  **Left out, it is
+        derived on shell from** ``u``: a PIC record's energy history is not
+        extra information, it is exactly ``sqrt(1 + |u|^2)`` -- the same
+        on-shell relation the kernel assumes (``|b_i|^2 = 1 - m^2/eps_i^2``).
+        This matters because the integrator switches to the local-energy phase
+        only when ``Trajectory.energy`` is set: without the derivation an
+        accelerating record is silently evaluated at a *fixed* incident
+        energy, and that is not the same answer -- measured on the production
+        LWFA record (``gamma`` 1.0 -> 2.4, interaction window), where the
+        fixed evaluation is additionally off shell, the two differ by 0.06%
+        with the ``dot`` kernel inside the resolvable band but by factors of
+        0.46-17 with the ``trace`` kernel, and the fixed evaluation's own two
+        kernels disagree there.  Pass an explicit array to override: a
+        *constant* array evaluates at a fixed ``eps`` deliberately, which is a
+        diagnostic rather than an answer on such a record.  ``u=None`` (a
+        record without momentum) still gives the fixed-energy path.
     n_samples : int or array, optional
         Length of the valid prefix.  The recorder writes fixed-shape
         NaN-padded arrays so that a mid-record gap stays visible; slice to
@@ -113,6 +122,14 @@ def as_trajectory_si(t_si, x_si, u=None, energy=None, n_samples=None) -> Traject
         energy = None if energy is None else np.asarray(energy)[:n]
 
     nat = _units.si_to_natural(t_si=t_si, x_si=x_si)
+    if energy is None and u is not None:
+        # The record's energy history is not extra information: the PIC stores
+        # the normalized momentum, so eps(t) = sqrt(1 + |u|^2) is exactly the
+        # on-shell energy the kernel assumes.  Leaving it unset would silently
+        # evaluate the record at one fixed eps -- see the `energy` parameter
+        # docstring for what that costs.
+        u_arr = np.asarray(u, dtype=np.float64)
+        energy = np.sqrt(1.0 + np.einsum("ij,ij->i", u_arr, u_arr))
     return as_trajectory(nat["t"], nat["x"], momentum=u, energy=energy)
 
 

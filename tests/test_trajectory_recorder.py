@@ -157,14 +157,20 @@ def test_pusher_stage_callback_changes_only_the_speed(tmp_path):
         assert np.allclose(a["u"], b["u"], rtol=1e-12, atol=1e-15)
 
 
-def test_adapter_energy_argument_switches_to_local_energy_mode():
-    """The integrator switches on ``Trajectory.energy``, not on ``local_energy()``.
+def test_adapter_derives_the_energy_history_and_allows_an_override():
+    """A PIC record's ``eps(t)`` is ``sqrt(1+|u|^2)``: derive it, do not fix it.
 
-    ``Trajectory.local_energy()`` is never consulted by the integrator, so an
-    accelerating record passed without ``energy`` is silently evaluated at a
-    fixed incident energy.  Pin that passing it actually changes the result.
+    The integrator switches to the local-energy phase only when
+    ``Trajectory.energy`` is set, so leaving it out used to evaluate an
+    accelerating record at a fixed incident energy *silently*.  The record
+    carries the momentum and the on-shell relation is exactly the one the
+    kernel assumes, so the adapter derives it.  An explicit array still wins
+    -- a constant one is how you ask for the fixed-energy comparison
+    deliberately -- and the raw constructor keeps the un-derived path.
     """
     from lambdapic.core.qed.baier_katkov import integrator as bki
+    from lambdapic.core.qed.baier_katkov import units as U
+    from lambdapic.core.qed.baier_katkov.trajectory import as_trajectory
 
     gamma = 10.0
     beta = np.sqrt(1.0 - 1.0 / gamma ** 2)
@@ -172,28 +178,40 @@ def test_adapter_energy_argument_switches_to_local_energy_mode():
     Omega = beta / rho
     t = np.linspace(0.0, turns * 2.0 * np.pi / Omega, n)
     phi = Omega * t
-    # a 5 -> 15 ramp along the record, built through the SI adapter
-    gam = np.linspace(5.0, 15.0, n)
+    gam = np.linspace(5.0, 15.0, n)              # a 5 -> 15 ramp
     r = np.column_stack([rho * np.cos(phi), rho * np.sin(phi), np.zeros_like(t)])
     u = (gam * beta)[:, None] * np.column_stack(
         [-np.sin(phi), np.cos(phi), np.zeros_like(t)])
-
-    from lambdapic.core.qed.baier_katkov import units as U
     t_si = U.natural_time_to_si(t)
     x_si = U.natural_length_to_si(r)
 
-    fixed = as_trajectory_si(t_si, x_si, u=u)
-    local = as_trajectory_si(t_si, x_si, u=u, energy=gam)
-    assert fixed.energy is None and local.energy is not None
+    derived = as_trajectory_si(t_si, x_si, u=u)
+    on_shell = np.sqrt(1.0 + np.einsum("ij,ij->i", u, u))
+    assert derived.energy is not None
+    assert np.allclose(derived.energy, on_shell, rtol=1e-12)
+
+    override = as_trajectory_si(t_si, x_si, u=u, energy=np.full(n, 10.0))
+    assert np.allclose(override.energy, 10.0)
+
+    # the un-derived (fixed-energy) path is still reachable, explicitly
+    nat = U.si_to_natural(t_si=t_si, x_si=x_si)
+    fixed = as_trajectory(nat["t"], nat["x"], momentum=u)
+    assert fixed.energy is None
+
+    # ... and no momentum at all leaves nothing to derive
+    assert as_trajectory_si(t_si, x_si).energy is None
 
     pars = Parameters(epsilon=10.0)
-    a = bki.compute_spectrum(fixed, pars, np.array([0.5]), theta_max=np.pi,
-                             n_theta=8, n_phi=1, axis=[0, 0, 1], checks="ignore")
-    b = bki.compute_spectrum(local, pars, np.array([0.5]), theta_max=np.pi,
-                             n_theta=8, n_phi=1, axis=[0, 0, 1], checks="ignore")
-    assert b.metadata["local_energy"] is True
+    kw = dict(theta_max=np.pi, n_theta=8, n_phi=1, axis=[0, 0, 1],
+              checks="ignore")
+    grid = np.array([0.5])
+    a = bki.compute_spectrum(fixed, pars, grid, **kw)
+    b = bki.compute_spectrum(derived, pars, grid, **kw)
     assert a.metadata["local_energy"] is False
-    assert float(a.dE_domega[0]) != pytest.approx(float(b.dE_domega[0]), rel=1e-3)
+    assert b.metadata["local_energy"] is True
+    # the record's own energy history is a different (and correct) answer
+    assert float(a.dE_domega[0]) != pytest.approx(float(b.dE_domega[0]),
+                                                  rel=1e-3)
 
 
 def test_recorder_returns_the_path_it_actually_wrote(tmp_path):
