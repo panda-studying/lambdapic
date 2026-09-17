@@ -15,7 +15,7 @@
 | 2026-09-12 | 第二轮审查：BUG-7/8/9 + 一批输入校验（回归 51→58 例） |
 | 2026-09-14 | 带状截断判据实验 → 判定**不做**（§3.5） |
 | 2026-09-15 | PIC 集成最小闭环：单位适配器 + 轨迹记录回调 + 静磁场测试台（11 处缺陷修复） |
-| 2026-09-16 | 生产 LWFA 轨迹上的判据检查（§3.1）；第三轮审查 BUG-10~13 + `_curvature_rate` 静止段 + P-2 证据审计（§7）；§3.5 在真实加速记录上用局域相位复算；本文档重排（原 §1–§9 编号改为现在的结构） |
+| 2026-09-16 | 生产 LWFA 轨迹上的判据检查（§3.1）；第三轮审查 BUG-10~13 + `_curvature_rate` 静止段 + P-2 证据审计（§7）；§3.5 在真实加速记录上用局域相位复算；端到端验证通过（§5.5）；`as_trajectory_si` 默认推导 `energy`（§4.8）；本文档重排（原 §1–§9 编号改为现在的结构） |
 
 ---
 
@@ -68,14 +68,21 @@ LCFA 是局域、非相干的 $\int dt\, (\mathrm dW_{\rm LCFA}/\mathrm dt\,\mat
 
 ### 2.1 未决 / 待做
 
+**面向"真正可用"的排序**（2026-09-16 复核后的清单；性能类明确排除在外）：端到端验证已完成（§5.5）；剩下的是两处会静默出错的记录接口（窗口、轴）、两个"从单粒子到物理结论"的部件，以及记录器的生产级验证。
+
 | 优先级 | 事项 | 说明 | 章节 |
 |---|---|---|---|
+| P1 | **沿任意轨迹的绝热（LCFA）参考** | 缺 $\int\mathrm dt\,(\mathrm dP/\mathrm d\omega)(\chi(t))$。没有它就无法对同一条 PIC 轨迹说"BK 比 LCFA 多了什么"——**那正是本模块存在的理由**；V8 只覆盖恒定 $\chi$ | §4.7 |
 | P1 | **端点亏损的物理修正** | 未做。前置：先有一条真正非重复（宽带／真实 PIC）轨迹，且靶值由 $L\to\infty$ 收敛性定义；$c/L$ 模型已被实测否定 | §4.1 |
 | P1 | **设计文档 `Baier-Katkov.md`** | 悬空引用已由 BKS 专著对照表替代（§5.4），但核与相位的**推导**仍无仓内文档 | §4.5 |
-| P2 | `compute_spectrum` 记录起点静止时的默认轴 | 现退到 $\hat{\mathbf z}$、`velocity_swing` 相对噪声方向算，只靠 $5/\gamma_0$ 地板顶到 $\pi$ 才没出错；喂 PIC 记录时应显式给 `axis=` 并裁到相互作用窗口 | §4.3 |
+| P2 | `compute_spectrum` 记录起点静止时的默认轴 | 现退到 $\hat{\mathbf z}$、`velocity_swing` 相对噪声方向算，只靠 $5/\gamma_0$ 地板顶到 $\pi$ 才没出错 | §4.3 |
+| P2 | **"裁到相互作用窗口"的工具** | 记录长度判据、默认轴、$\chi$ 分布全都依赖它，现在靠调用方手写 `slice` | §4.8 |
+| P2 | **系综加权求和** $\sum_i w_i S_i$ | `Spectrum` 没有加法器／加权；宏粒子权重已落盘（npz 的 `w`）。这是"一个粒子"到"一束电子"的台阶 | §6.3 |
+| P2 | **记录器在真实多 rank 生产运行上验证** | 现有 MPI 用例是合成的 6 步；BUG-12 的修复也只在它上面验过 | §6.4 |
 | P2 | 闭环／大摆角情形的角度积分 | 需沿速度路径自适应布方向网格（新方法，非参数调整）；现在只做到"报警" | §4.2 |
 | P2 | 带状截断的**重启前置** | 若将来仍要做：先建"频率平均谱 + 平滑窗"的观测量，并在长度 $\gg T$ 的宽带测试台上重做截断曲线 | §4.4 |
-| P3 | 多轨迹批量接口 | 共享 $\omega/\mathbf n$ 网格的多轨迹一次求值 | §6.3 |
+| P3 | **PIC 记录 → 谱的可复现示例 + README 教程** | 流程现在只活在 `/tmp` 脚本里 | §6.3 |
+| P3 | 多轨迹批量接口 | 共享 $\omega/\mathbf n$ 网格的多轨迹一次求值（性能+能力） | §6.3 |
 | P4 | 在线事件采样／自旋分辨核／NUFFT | 周级；自旋分辨需要新核 | §6.3 |
 
 ### 2.2 已完成的里程碑（压缩）
@@ -87,6 +94,8 @@ LCFA 是局域、非相干的 $\int dt\, (\mathrm dW_{\rm LCFA}/\mathrm dt\,\mat
 - **P-4 自适应锥角**：09-11 完成（原文方向判断被推翻，见 §3.2）。
 - **PIC 集成闭环**：单位适配器 `as_trajectory_si` + 轨迹记录回调 `TrajectoryRecorder` + 静磁场测试台 + 真实生产轨迹判据检查（§6）。
 - **判据结论**：带状截断**判定不做**（§3.5）；采样判据是硬约束，生产 LWFA 算例通过（§3.1）。
+- **记录接口**（09-16）：`as_trajectory_si` 默认从 `u` 在壳推导 `energy`，固定 $\varepsilon$ 改为显式（§4.8 第 1 条）。
+- **端到端验证**（09-16，§5.5）：PIC 记录 → BK 谱对解析同步辐射谱 0.9874–1.0048（V8 同量级）；圈间相干 $n^2$ 律首次在真实 PIC 记录上复现（2 圈/1 圈 = 4.000）。
 - **判据工具**：`banding.py` 探针（`lag_profile`/`truncation_curve`）现已支持**局域能量相位**（复用积分器的 `_local_vertex_arrays` 与 `phase.local_phase_tables`；固定分支逐位未动），三条用例钉住"与积分器逐方向一致／恒能量退化／平移不变"。
 
 ---
@@ -133,7 +142,7 @@ $$\Phi_{ij}=\omega\big[(T_j-T_i)-\mathbf n\cdot(\mathbf R_j-\mathbf R_i)\big],\q
 
 **在壳一致性由调用方负责**：核假定 $\lvert\mathbf b_i\rvert^2=1-m^2/\varepsilon_i^2$。局域的 `b1·b2-1` 与固定的 $(\mathbf b_1-\mathbf b_2)^2$ 两种约定**只在在壳时等价**——拿"变 $\gamma$ 轨迹 + 恒定 $\varepsilon$"去比会离壳、假性差 9%。
 
-**"漏传 `energy`"的代价是核与频率相关的，不能用单个倍数概括**（在生产记录上实测，$\gamma:1.0\to2.4$）：`dot` 核在可分辨频段内固定≈局域（$\le0.06\%$，因为 $\omega/\varepsilon\sim10^{-5}$ 时它的系数几乎不含 $\varepsilon$），而 `trace` 核下固定模式的答案**随任意选的 $\varepsilon$ 摆动 17 倍**（$\varepsilon=\gamma_{\max}$ 17.1、$\bar\gamma$ 2.20、$\gamma_{\min}$ 0.96），局域形式给唯一值。（旧报的"$\omega=1$ 处差 4.5 倍"出自 BUG-10 的坏相位，**已作废**。）
+**"漏传 `energy`"的代价是核与频率相关的，不能用单个倍数概括**（在生产记录上实测，$\gamma:1.0\to2.4$）：`dot` 核在可分辨频段内固定≈局域（$\le0.06\%$，因为 $\omega/\varepsilon\sim10^{-5}$ 时它的系数几乎不含 $\varepsilon$），而 `trace` 核下固定模式的答案**随任意选的 $\varepsilon$ 摆动 17 倍**（$\varepsilon=\gamma_{\max}$ 17.1、$\bar\gamma$ 2.20、$\gamma_{\min}$ 0.96），局域形式给唯一值。（旧报的"$\omega=1$ 处差 4.5 倍"出自 BUG-10 的坏相位，**已作废**。）**这条陷阱已于 2026-09-16 在适配器层面收掉**：`as_trajectory_si` 在给了 `u` 而没给 `energy` 时按在壳值推导（§4.8 第 1 条），固定路径改为显式——用 `as_trajectory(...)` 直接构造，或传一个**常数** `energy` 数组（那是刻意的诊断，不是答案）。
 
 ### 3.4 圈间相干：已测到的 LCFA 判别信号
 
@@ -229,6 +238,29 @@ $\beta_0\approx0$（PIC 记录开头激光还没到）时默认轴退到 $\hat{\
 - **README §6.5 漏参数**：`compute_spectrum` 的签名说明里没有 `checks`。
 - **README §6 缺 `banding.py` 一节**（编号从 6.10 直接跳到 6.12，空缺处本该是它）。它是探针而非用户 API，所以当初没写；但既然 §3.5 的结论由它支撑，至少该有一行条目指向它。
 
+### 4.7 沿任意轨迹的绝热（LCFA）参考：缺，而且需要一个新记录通道（未决）
+
+模块存在的理由就是"BK 与 LCFA 的差别"，而在 PIC 场景里这个差别必须**在同一条轨迹上**量：绝热参考是
+
+$$\left.\frac{\mathrm dP}{\mathrm d\omega}\right|_{\rm ad}=\int \mathrm dt\;\frac{\mathrm dP}{\mathrm d\omega}\big(\chi(t)\big),$$
+
+`reference.py` 只给"给定 $\chi$ 的局域速率"（`quantum_synchrotron_rate`），没有任何东西沿轨迹积分它。V8 的对照是恒定 $\chi$，覆盖不了这件事。
+
+**而它缺一个输入：$\chi(t)$ 从哪来。** 记录器只写 `t/x/u`，不带场。两条路：
+
+- **纯磁场记录**（如 §5.5 的测试台）：$\chi=\gamma^2\beta^2/\rho=\gamma^2\lvert\mathrm d\mathbf v/\mathrm dt\rvert\cdot(\ldots)$ 可由轨迹本身定出，模块已有 `_curvature_rate`。
+- **激光／尾场记录**（LWFA 这类真正想做的）：$\chi=\gamma\lvert\mathbf E_\perp+\mathbf v\times\mathbf B\rvert/E_{\rm cr}$ **必须**用粒子处的 $\mathbf E,\mathbf B$——记录器没有这个通道。要么给记录器加场通道，要么在每个记录步算一次 $\chi$ 一起落盘（主模拟在辐射开启时本来就算 $\chi$，但喂 BK 的轨迹要求**关掉辐射**，所以那条路不会自动带来它）。
+
+**交付物**：一个沿轨迹的绝热谱函数 + 记录器的 $\chi$（或 $\mathbf E,\mathbf B$）通道；与 BK 同一方向网格、同一 $\omega$ 网格，直接给逐 $\omega$ 的比值。
+
+### 4.8 记录接口的三个默认值：都会静默出错（未决）
+
+喂进 PIC 记录时，有三处"不写就悄悄错"的地方，都该在接口层面收掉：
+
+1. ~~**`energy`**：记录里 $\varepsilon(t)=\sqrt{1+\lvert\mathbf u\rvert^2}$ 是精确已知的，却要求调用方显式传~~ **已修（2026-09-16）**：`as_trajectory_si` 在给了 `u` 而没给 `energy` 时按在壳值推导（实测与 $\sqrt{1+\lvert\mathbf u\rvert^2}$ 逐位相同），显式数组仍可覆盖，`u=None` 与 `as_trajectory(...)` 仍给固定 $\varepsilon$ 路径。真实 LWFA 记录上验证：新默认给出的正是局域值（`trace` 核在 $1\omega_0$ 处 $-1.1428\times10^{-2}$），而显式固定 $\varepsilon$ 给 $-6.665\times10^{-4}$（比值 17.1，与 §3.3 表一致）。
+2. **窗口**：记录长度判据、默认轴、$\chi$ 分布全都依赖"裁到相互作用窗口"，现在靠调用方手写 `slice`。**修法**：给一个按 $\lvert\mathbf u\rvert$ 或 $\lvert\mathrm d\mathbf u/\mathrm dt\rvert$ 阈值裁窗的工具，返回窗口与两侧的静止占比。
+3. **轴**：$\beta_0\approx0$ 时 `compute_spectrum` 的默认轴退到 $\hat{\mathbf z}$（§4.3）。裁窗之后默认轴自然可用，但两者都应显式化。
+
 ---
 
 ## 5. 验证体系与可信度
@@ -273,6 +305,24 @@ $\beta_0\approx0$（PIC 记录开头激光还没到）时默认轴退到 $\hat{\
 
 数值核对逐位相等（差 $0.00\mathrm{e}{+}00$）。**三处方法差异**（均非错误）：(1) P-2 局域能量超出专著范围（专著只保留形成长度内能量常数）；(2) 专著用小角展开解析积掉发射角，本模块保留完整角依赖做数值锥积分；(3) 未实现自旋／极化分辨。
 
+### 5.5 端到端验证：PIC 记录 → BK 谱（2026-09-16 新增）
+
+**这是此前唯一没有的验证层次**：V1–V8 用解析轨迹、记录器用合成用例，而"Yee 场 → Boris 推进 → 记录器 → SI 适配器 → 双时间积分"这条**接缝**从未对过已知答案。`example/bk-testbed.py --compare` 现在把它接起来：均匀磁场里一个电子（$\gamma=5$、$\chi=0.5$、$dx=0.5$ 自然单位、$256^2$ 网格、916 步/周期、4 个周期），经真实管线取轨迹，算 BK 谱，与 `reference.quantum_synchrotron_rate` 对拍（V8 的同一套判据，但轨迹来自 PIC）。用一圈记录的 $\mathrm dE/\mathrm d\omega$ 对 $T\,\mathrm dP/\mathrm d\omega$，在**反冲移动谐波**处评估。
+
+| 检查 | 结果 |
+|---|---|
+| 轨道 vs 连续解 | $\Omega$ 之比 0.999996、$\rho=48.000$（连续 48.000）、$\chi=0.5000$：推进器误差 $4\times10^{-6}$ |
+| 旋转相位线性度 | 线性拟合残差 $1.7\times10^{-12}$ rad / 1231 自然单位（舍入级） |
+| $\lvert\mathbf u\rvert$ 恒定性 | 起伏 $1.0\times10^{-12}$（均匀场不做功 ⇒ 无反冲背景成立） |
+| **BK / 精确**（$\delta=0.05/0.10/0.20/0.30$） | **0.9874 / 0.9965 / 1.0025 / 1.0048** |
+| dot vs trace | 逐位相同（恒能量记录 ⇒ 在壳恒等式） |
+| 局域 vs 固定 $\varepsilon$ | 逐位相同（接缝一致） |
+| **2 圈 / 1 圈** | 每个谐波都 **4.000** —— 圈间相干 $n^2$ 律**首次在真实 PIC 记录**上复现（§3.4） |
+
+**判定**：接缝通过，精度与 V8 同量级。最大偏差在最小 $\delta$（−1.3%），可归给参照谱自身的超相对论误差：V8 在 $\gamma=10$ 处残差 0.3%，即约 $0.3/\gamma^2$，按同一标度外推到本测试台的 $\gamma=5$ 是 **1.2%**，与实测的 1.3% 吻合。采样判据要求 $\delta\lesssim0.3$（$\omega_c$ 处 margin 3.45），比较只在可分辨带内做。
+
+**边界（诚实记录）**：这是**最干净**的测试台——均匀场不做功、$\lvert\mathbf u\rvert$ 恒定到 $10^{-12}$，所以它检验的是**几何与单位接缝**（Boris → 记录器 → SI 适配 → 时间网格 → 方向网格 → 双时间积分），**没有检验 PIC 噪声对谱的影响**。真实 LWFA 记录里的噪声（场插值、粒子推进、等离子体涨落）尚未量化，那需要 §4.7 的场/$\chi$ 通道在真实记录上另做。
+
 ---
 
 ## 6. 与主模拟的集成
@@ -281,7 +331,7 @@ $\beta_0\approx0$（PIC 记录开头激光还没到）时默认轴退到 $\hat{\
 
 主模拟内部是 **SI 单位**，BK 模块是 Compton 单位；`units.si_to_natural` 覆盖 t/x/E/ω 与 $p\to u$。
 
-- **`trajectory.as_trajectory_si(t_si, x_si, u, energy=None, n_samples=None)`**：单位适配器。$u$ 透传不换算（它已是 PIC 存的 `ux,uy,uz`）；**变能量记录必须传 `energy`**，否则静默按固定 $\varepsilon$ 评估（§3.3）。
+- **`trajectory.as_trajectory_si(t_si, x_si, u, energy=None, n_samples=None)`**：单位适配器。$u$ 透传不换算（它已是 PIC 存的 `ux,uy,uz`）；**变能量记录的 `energy` 现在自动推导**（在壳 $\gamma=\sqrt{1+\lvert\mathbf u\rvert^2}$）；固定 $\varepsilon$ 需显式构造，见 §4.8。
 - **`callback/trajectory.py` 的 `TrajectoryRecorder`**：挂 `start` 阶段，按 `_id` 追踪选中粒子（含跨 rank 迁移），写 NaN 填充的定形 npz。**移动窗口会在运行中新建粒子**，末态最热电子可能只有最后几百步历史——要全程记录就关掉移动窗口，或把盒子开到脉冲不出界。
 - **双时间积分不需要插值／重采样**：梯形权重支持非均匀网格，PIC 的时间网格可直接用（将来若走 FFT 路径才需重采样到均匀）。
 - 集成点是 `_push_position_1`/`_interpolator` 之后与 `radiation` 之后，`@callback(stage=...)` 是自然挂载点。
@@ -295,7 +345,15 @@ $\beta_0\approx0$（PIC 记录开头激光还没到）时默认轴退到 $\hat{\
 
 ### 6.3 未做
 
-多轨迹批量（共享 $\omega/\mathbf n$ 网格）、系综加权加法器、CI 冒烟测试。
+- **系综加权求和**：记录 $N$ 个粒子 → $\sum_i w_i S_i$。宏粒子权重已经落盘（`TrajectoryRecorder` 的 npz 里有 `w`），但 `Spectrum` 没有加法器／加权工具，多粒子驱动也没有——这是"单粒子谱"到"一束电子的谱"的台阶。
+- **多轨迹批量**：共享 $\omega/\mathbf n$ 网格的多轨迹一次求值（也是性能）。
+- **记录器的场／$\chi$ 通道**：绝热参考（§4.7）需要粒子处的 $\mathbf E,\mathbf B$（或直接 $\chi$），现在只有 `t/x/u`。
+- **可复现示例**：LWFA"跑→记录→出谱"的流程目前只活在 `/tmp` 脚本里，应搬进 `example/`；README 补一节"如何从 Simulation 得到一条 Trajectory"的最小教程。
+- **CI 冒烟测试**：pytest 化的 V1–V8 + 一条端到端 PIC 轨迹 → BK 谱。
+
+### 6.4 记录器的生产级验证（未决）
+
+`TrajectoryRecorder` 的 MPI 正确性只有**合成的 6 步用例**（`tests/mpi/test_trajectory_recorder.py`，BUG-12 的修复就是在它上面验的）。真实多 rank 生产运行（粒子跨 rank 迁移、移动窗口、真实 patch 划分）**没有跑过**——而 §6.1 记的"移动窗口会在运行中新建粒子"这条用法陷阱，也只在单 rank 的检查里遇到过。建议在一条真实的多 rank LWFA 运行上跑一次，确认记录完整、`n_samples` 与 patch 数无关。
 
 ---
 
@@ -338,7 +396,7 @@ python -m lambdapic.core.qed.baier_katkov.validation          # V1–V8，约 6 
 python -m pytest tests/test_baier_katkov.py -n 0 -q           # 回归（-n 0 必须写）
 python -m lambdapic.core.qed.baier_katkov.validation_plot     # 重新生成 validation_summary.png
 python -m lambdapic.core.qed.baier_katkov.coherence           # 圈间相干测量（§3.4）
-python example/bk-testbed.py                                  # 静磁场 PIC 测试台
+python example/bk-testbed.py --periods 4 --compare          # 端到端验证（§5.5），约 2 分钟                                  # 静磁场 PIC 测试台
 ```
 
 - 跑 PIC 前设 `LAMBDAPIC_CHECK_UPDATE=0`，否则 `Simulation.run()` 会因 PyPI 版本检查阻塞约 9 s（本机无外网）。

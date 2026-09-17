@@ -318,7 +318,8 @@ validation.py  V1–V8  ──► validation_plot.py ──► validation_summar
 
 ### 6.2 `trajectory.py` — 轨迹输入与插值
 
-- `as_trajectory(time, position, momentum=None, energy=None, mass=1.0, charge=1.0)`：从裸数组构造 `Trajectory`，校验时间严格递增（$t_0 < t_1 < \dots$）。
+- `as_trajectory(time, position, momentum=None, energy=None)`：从裸数组构造 `Trajectory`，校验时间严格递增（$t_0 < t_1 < \dots$）与各字段有限（`mass`/`charge` 不在这里，它们归 `Parameters`）。`energy=None` 即**固定入射能量**模式——对 $|\mathbf u|$ 恒定的记录正确，对变化的记录静默错，所以它不由本构造函数替调用方猜。
+- `as_trajectory_si(t_si, x_si, u=None, energy=None, n_samples=None)`：**PIC 记录（SI）→ 自然单位的适配器**。$u$ 透传不换算；**不给 `energy` 就按在壳值 $\sqrt{1+\lvert\mathbf u\rvert^2}$ 推导**（PIC 记录的能量历史不是额外信息，正是核假定的那个在壳关系），显式数组仍可覆盖——传常数数组就是刻意按固定 $\varepsilon$ 评估（诊断用）。`n_samples` 用于裁掉 NaN 填充尾巴。
 - `uniform_trajectory(r_of_t, t0, t1, n_samples, **kwargs)`：把可调用对象 $r(t) \to (3,)$（或 $(N_t,3)$）在均匀网格上采样成轨迹，适合构造解析测试轨迹。
 - `linear_interpolate(r, time, t_query)`：把 $(N_t,3)$ 位置历史线性插值到查询时刻（查询点必须在记录区间内）。
 
@@ -520,6 +521,14 @@ traj = Trajectory(time=t, position=r, momentum=u, energy=eps_t)  # eps_t: (Nt,)�
 spec = compute_spectrum(traj, params, omega_grid, ...)
 ```
 
+**从 PIC 记录**：[`as_trajectory_si`](#62-trajectorypy--轨迹输入与插值) 自己按在壳值补上能量历史，不必手动传 `energy`：
+
+```python
+from lambdapic.core.qed.baier_katkov import as_trajectory_si
+
+traj = as_trajectory_si(t_si, x_si, u=u, n_samples=n)   # eps(t)=sqrt(1+|u|²)，自动
+```
+
 ---
 
 ## 8. 运行环境与常用命令
@@ -541,14 +550,16 @@ python -m pytest tests/test_baier_katkov.py -n 0 -q -m "not slow"   # 跳过全�
 
 ## 9. 验证与回归测试
 
-- **V1–V8 套件**（[§6.9](#69-validationpy--v1v8-验证套件)）约 17 s，覆盖相位符号、积分器自洽、经典极限、绝对归一化（Larmor）、直线零辐射、谱正性、核恒等式、量子同步辐射谱对照。当前全部通过。
-- **pytest 回归**（`tests/test_baier_katkov.py`）共 58 例：
-  - 固定能量路径 23 例（含 BUG 修复回归、两后端一致性、V8 类对照、慢速全谱扫描 2 例）；
-  - 局域能量路径 12 例（2026-09-09 新增，7 个测试函数）：恒能量退化回固定路径（$10^{-16}$）、局域 dot ≡ trace、numba ≡ numpy（$10^{-15}$）、厄米性（虚部 $10^{-16}$）、谱正性、经典模式能量无关（$10^{-12}$）、入参校验；测试轨迹为精确闭合、在壳、能量变化的圆轨道（$\gamma$ 扫 7→13）；
-  - 适用性守卫 5 例（P-3：Nyquist 边界、开弧亏损、可控制性、直线不适用、metadata）；
-  - 角度守卫 8 例（2026-09-11 P-4，8 个测试函数）：两板权重守恒、$\theta_c$ 标度与方向、速度摆幅、自适应锥角、守卫阈值对实测精度边界、摆动记录必报警、`checks` 可控制性、metadata 角度诊断；
-  - Test B 圈间相干 3 例（2026-09-11，[coherence.py](coherence.py)）：$\omega$ 窗口落在反冲移动谐波上且间距 $=\Omega(\varepsilon'/\varepsilon)^2$、线中心密度 $\propto n^2$（$n=1,2$ 两点）、单圈线宽不可测（Dirichlet 核恒为 1）；
-  - **第二轮审查修复 7 例（2026-09-12）**：角度边界诊断指向锥边缘节点（合成输入 + 与真实谱最宽节点份额对拍）、$\omega=0$/负值在 `compute_spectrum`/`d2_probability[_batch]`/`Spectrum` 全被拒、size-1 数组 `omega` 可被单点入口接受、`Trajectory` 拒绝非单调时间与非有限量、`Trajectory`/`as_trajectory` 不再接受 `mass`/`charge`（改为 `TypeError`，并验证 `Parameters.charge` 的 $q^2$ 生效）、非法 `split` 抛错且 metadata 报告生效网格。
+- **V1–V8 套件**（[§6.9](#69-validationpy--v1v8-验证套件)）约 6 s，覆盖相位符号、积分器自洽、经典极限、绝对归一化（Larmor）、直线零辐射、谱正性、核恒等式、量子同步辐射谱对照。当前全部通过，数值与 `REVIEW_AND_ROADMAP.md` §5.1 记录的逐位一致。
+- **端到端验证**（`python example/bk-testbed.py --periods 4 --compare`，约 2 分钟）：均匀磁场里一个电子经**真实 PIC 管线**（Yee 场 → Boris 推进 → 记录器 → SI 适配器）取出轨迹，再算 BK 谱对解析同步辐射谱——$\delta=0.05$–$0.3$ 处比值 **0.9874–1.0048**；同一记录上还复现圈间相干 $n^2$ 律（2 圈/1 圈 $=4.000$）。这是**唯一**检验"轨迹获取接缝"的检查（V1–V8 用解析轨迹），详见 `REVIEW_AND_ROADMAP.md` §5.5。
+- **pytest 回归**（`tests/test_baier_katkov.py`、`tests/test_trajectory_recorder.py`、`tests/mpi/test_trajectory_recorder.py`）共 **76 例**（+1 skip）：
+  - 固定能量路径：两后端一致性（非均匀网格 × 3 核 × 2 相位，$10^{-14}$）、$|A|^2$ 恒等式、Schwinger 绝对归一化、`recoil` 选项生效、非法输入拒绝、慢速全谱扫描；
+  - 局域能量路径：恒能量退化回固定路径（$10^{-16}$）、局域 dot ≡ trace、numba ≡ numpy、厄米性、谱正性、经典模式能量无关、入参校验，以及 2026-09-16 新增的**平移不变**（BUG-10 的判别判据）与**采样守卫含 $\omega$**（BUG-11）；
+  - 适用性守卫（Nyquist 边界、开弧亏损、可控制性、直线不适用、metadata）与角度守卫（两板权重守恒、$\theta_c$ 标度与方向、速度摆幅、自适应锥角、阈值对实测边界、摆动记录必报警、`checks` 可控制性）；
+  - Test B 圈间相干 3 例；
+  - `banding` 探针 3 例（2026-09-16）：与积分器逐方向求和一致（两相位 × 两核）、恒能量逐箱退化、曲线平移不变；
+  - 记录器：跨 rank 合并（含 `mpirun -n 2` 用例，BUG-12）、`window=` 参数不存在（BUG-13）；
+  - `_curvature_rate` 在被静止段污染的记录上仍给出真实曲率率（2026-09-16）。
 
 ---
 
@@ -565,7 +576,7 @@ python -m pytest tests/test_baier_katkov.py -n 0 -q -m "not slow"   # 跳过全�
 | 记录起点静止（$\beta_0\approx0$）时 `compute_spectrum` 的默认轴退到 $\hat{\mathbf z}$ | 喂 PIC 记录时显式给 `axis=`，并裁到相互作用窗口（路线图 §4.3） |
 | 局域能量模式要求能量与动量**在壳一致**（$\varepsilon_i=m\sqrt{1+\lvert\mathbf u_i\rvert^2}$），模块不校验 | 用 `Trajectory.local_energy()` 的在壳回退值，或自证一致（[§2.4](#24-局域能量推广-p-2)） |
 | 输入轨迹必须**无辐射反冲**，否则双计量子反冲 | PIC 里关掉 radiation 再录轨迹（[§1](#1-模块定位与范围)、路线图 §6.2） |
-| 变能量记录**必须传 `energy`**，否则静默按固定 $\varepsilon$ 评估 | `as_trajectory_si(..., energy=γ)`；漏传的代价与核、频率都有关（[§2.4](#24-局域能量推广-p-2)、路线图 §3.3） |
+| 变能量记录的 `energy` **由 `as_trajectory_si` 自动从 `u` 在壳推导**；要刻意按固定 $\varepsilon$ 评估须显式构造 | 正常用法什么都不用传；固定 $\varepsilon$ 用 `as_trajectory(...)` 或传常数数组，代价见 [§2.4](#24-局域能量推广-p-2) 与路线图 §3.3 |
 | `TrajectoryRecorder` 遇上**移动窗口**时，末态最热电子可能只有末尾几百步历史（窗口在运行中新建粒子） | 关掉移动窗口，或把盒子开到脉冲不出界（路线图 §6.1） |
 | 准经典：$\chi\lesssim1$；自旋与极化只做求和／平均 | 自旋分辨需要新核，**未实现** |
 
